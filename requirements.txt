@@ -1,0 +1,16 @@
+# Webhook runtime deps. The deployed venv is shared with open_deep_research
+# (LangGraph-based deep-research agent) at ~/open_deep_research/.venv. If you
+# split it out, install these. Versions are minimum known-good.
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.27
+pydantic>=2.7
+anthropic>=0.40
+langgraph-sdk>=0.1.40
+llama-index-core>=0.12
+llama-index-embeddings-huggingface>=0.4
+llama-index-vector-stores-chroma>=0.3
+llama-index-retrievers-bm25>=0.4
+llama-index-postprocessor-sbert-rerank>=0.3
+chromadb>=0.5
+sentence-transformers>=3.0

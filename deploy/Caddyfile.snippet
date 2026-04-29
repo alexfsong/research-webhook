@@ -1,0 +1,5 @@
+# Append to /etc/caddy/Caddyfile, then `systemctl reload caddy`.
+# Replace with your domain.
+lisearch.duckdns.org {
+    reverse_proxy 127.0.0.1:8000
+}
