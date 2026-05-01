@@ -60,7 +60,7 @@ All routes (except `/health`) require `Authorization: Bearer <WEBHOOK_API_KEY>`.
               │     PWA (static/, browser)    │
               └─────────────┬─────────────────┘
                             │ Bearer
-        https://lisearch.duckdns.org    (Caddy + Let's Encrypt)
+  https://lisearch.195-201-99-206.sslip.io  (Caddy + Let's Encrypt)
                             │
                             ▼
        ┌────────────────────────────────────────────┐
@@ -77,6 +77,13 @@ All routes (except `/health`) require `Authorization: Bearer <WEBHOOK_API_KEY>`.
      └───────────────┘  └────────────────┘           │ POST /research_callback
                                                      ▼ (back to webhook)
 ```
+
+## Box ops (multi-app)
+
+This service shares a Hetzner box with other apps. **Read [INFRA.md](INFRA.md)
+before deploying anything new** — it documents the box conventions (port
+registry, hostname pattern, systemd templates, Caddy reload flow) other agents
+must follow to avoid clashes.
 
 ## Deploy on Hetzner (or any Ubuntu 24.04 box)
 
@@ -110,7 +117,7 @@ sudo tee -a /etc/caddy/Caddyfile < deploy/Caddyfile.snippet
 sudo systemctl reload caddy
 
 # 6. Smoke test
-curl -sS https://lisearch.duckdns.org/health
+curl -sS https://lisearch.195-201-99-206.sslip.io/health
 ```
 
 The service binds to `127.0.0.1:8000`; only Caddy reaches it. Don't open
