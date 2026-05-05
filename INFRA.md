@@ -53,7 +53,8 @@ All HTTP services bind `127.0.0.1` and sit behind Caddy. Pick the next free port
 | 22 | ssh | (system) |
 | 80, 443 | caddy | `caddy.service` |
 | 8000 | research-webhook (FastAPI) | `research-webhook.service` |
-| 8001+ | available | — |
+| 8001 | monfps (Node/Colyseus FPS game) | `monfps.service` |
+| 8002+ | available | — |
 
 **Update this table in the same PR that adds your app.**
 
@@ -69,6 +70,7 @@ providers, but sslip.io passes. Pattern:
 
 Existing:
 - `lisearch.195-201-99-206.sslip.io` → research-webhook
+- `monfps.195-201-99-206.sslip.io` → monfps
 
 Caddy auto-issues a Let's Encrypt cert via http-01 on first request. No manual
 cert ops.
@@ -260,6 +262,7 @@ systemctl list-timers
 | App | Repo | Unit | Port | Hostname | Persistent state |
 |-----|------|------|------|----------|------------------|
 | research-webhook | https://github.com/alexfsong/research-webhook | `research-webhook.service` | 8000 | `lisearch.195-201-99-206.sslip.io` | `~/research-data/{courses.db,chroma/,reports/,hf-cache/}` |
+| monfps | https://github.com/alexfsong/pokemon-fps | `monfps.service` | 8001 | `monfps.195-201-99-206.sslip.io` | none (in-memory match state only) |
 
 Companion (off-box, fires `/ingest`): https://github.com/alexfsong/agentic-research-play
 
