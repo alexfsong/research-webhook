@@ -1,23 +1,23 @@
-"""FastAPI webhook for triggering deep research runs + PWA backend."""
+"""FastAPI webhook: PWA backend + Ask pipeline (cloud routine + local skill fallback)."""
 import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import sys
 import time
-import traceback
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from langgraph_sdk import get_client
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,42 +26,26 @@ import courses_db  # noqa: E402 — sqlite course store
 import courses  # noqa: E402 — course generation pipeline
 courses_db.init_db()  # idempotent schema bootstrap
 
-
-def _load_env_file(path: str) -> None:
-    """Lightweight .env loader so the webhook shares keys with the agent service."""
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                k, v = k.strip(), v.strip().strip('"').strip("'")
-                if k and k not in os.environ:
-                    os.environ[k] = v
-    except FileNotFoundError:
-        pass
-
-
-_load_env_file(os.path.expanduser("~/open_deep_research/.env"))
-_load_env_file(os.path.expanduser("~/research-agent-tools/.env"))
-
 BASE_DIR = Path(__file__).parent.resolve()
 STATIC_DIR = BASE_DIR / "static"
-LANGGRAPH_URL = os.environ.get("LANGGRAPH_URL", "http://127.0.0.1:2024")
-ASSISTANT_ID = os.environ.get("LANGGRAPH_ASSISTANT", "Deep Researcher")
-RUN_TIMEOUT_SECONDS = int(os.environ.get("RUN_TIMEOUT_SECONDS", "1800"))
 SYNTHESIS_RATE_PER_MIN = int(os.environ.get("SYNTHESIS_RATE_PER_MIN", "10"))
 LLAMAINDEX_ENABLED = os.environ.get("LLAMAINDEX_ENABLED", "true").lower() == "true"
 REPORTS_DIR = Path(os.path.expanduser("~/research-data/reports")).resolve()
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-ERRORS_DIR = (REPORTS_DIR.parent / "errors").resolve()
-ERRORS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = REPORTS_DIR.parent
+AUDIT_LOG_PATH = DATA_DIR / "ask-audit.log"
 API_KEY = os.environ.get("WEBHOOK_API_KEY", "").strip()
 ANTHROPIC_OAT = os.environ.get("ANTHROPIC_OAT", "").strip()
 ROUTINE_RESEARCH_FIRE_URL = os.environ.get("ROUTINE_RESEARCH_FIRE_URL", "").strip()
+ROUTINE_INGEST_ASK_FIRE_URL = os.environ.get("ROUTINE_INGEST_ASK_FIRE_URL", "").strip()
 ROUTINE_FIRE_BETA = os.environ.get("ROUTINE_FIRE_BETA", "experimental-cc-routine-2026-04-01").strip()
 RESEARCH_RUN_TTL = int(os.environ.get("RESEARCH_RUN_TTL", "3600"))
+ASK_RUN_TTL = int(os.environ.get("ASK_RUN_TTL", "3600"))
+ASK_DEFAULT_MAX_FETCHES = int(os.environ.get("ASK_DEFAULT_MAX_FETCHES", "10"))
+CLAUDE_FALLBACK_USER = os.environ.get("CLAUDE_FALLBACK_USER", "claude-runner").strip()
+CLAUDE_FALLBACK_TIMEOUT = int(os.environ.get("CLAUDE_FALLBACK_TIMEOUT", "240"))
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/home/claude-runner/.npm-global/bin/claude").strip()
+POOL_FULL_COOLDOWN_S = int(os.environ.get("POOL_FULL_COOLDOWN_S", "60"))
 
 log = logging.getLogger("webhook")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -93,10 +77,6 @@ def check_auth(authorization: str | None = Header(default=None)):
         raise HTTPException(403, "invalid token")
 
 
-class ResearchRequest(BaseModel):
-    query: str
-
-
 class SynthesizeLIRequest(BaseModel):
     question: str
     k: int = 8
@@ -104,8 +84,22 @@ class SynthesizeLIRequest(BaseModel):
     subq: bool = False
 
 
-class ContinueRequest(BaseModel):
-    instruction: str
+class AskRequest(BaseModel):
+    question: str
+    mode: Literal["auto", "cloud", "local"] = "auto"
+    thread_id: str | None = None
+    max_fetches: int | None = None
+    urls: list[str] | None = None
+    topic: str | None = None
+
+
+class AskCallback(BaseModel):
+    run_id: str
+    route: Literal["cloud", "local"] = "cloud"
+    status: Literal["complete", "failed"] = "complete"
+    ingested: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
 
 
 class IngestRequest(BaseModel):
@@ -159,111 +153,6 @@ def slug(s: str, max_len: int = 60) -> str:
     return s[:max_len] or "query"
 
 
-_JUNK_PATTERNS = (
-    "error generating final report",
-    "error code: 429",
-    "rate_limit_error",
-    "anthropic.ratelimiterror",
-)
-
-
-def _looks_like_junk(report: str) -> bool:
-    """True if report body is a rate-limit/error stub worth excluding from the corpus."""
-    body = report.strip()
-    if not body:
-        return True
-    head = body[:600].lower()
-    if any(p in head for p in _JUNK_PATTERNS):
-        return True
-    return False
-
-
-async def _save_report(*, query: str, report: str, thread_id: str, ts: str, base: str) -> Path:
-    header = f"# Research: {query}\n\n_Generated {ts} · thread={thread_id}_\n\n---\n\n"
-    if _looks_like_junk(report):
-        err_path = ERRORS_DIR / f"{base}.err.md"
-        err_path.write_text(header + report)
-        log.warning("report matched junk pattern; wrote %s and skipped corpus ingest", err_path)
-        return err_path
-    report_path = REPORTS_DIR / f"{base}.md"
-    report_path.write_text(header + report)
-    report_id = f"report_{uuid.uuid4().hex[:12]}"
-    if LLAMAINDEX_ENABLED:
-        try:
-            r = await _li().aingest_report(
-                report_text=report,
-                query=query,
-                thread_id=thread_id,
-                report_id=report_id,
-            )
-            log.info("llamaindex ingested %s: %d nodes", r["report_id"], r["nodes"])
-        except Exception:
-            log.exception("llamaindex ingest failed (continuing)")
-    log.info("saved %s (report_id=%s)", report_path, report_id)
-    return report_path
-
-
-async def _await_run(client, thread_id: str, run_id: str) -> str:
-    deadline = asyncio.get_event_loop().time() + RUN_TIMEOUT_SECONDS
-    while True:
-        if asyncio.get_event_loop().time() > deadline:
-            raise TimeoutError(f"run exceeded {RUN_TIMEOUT_SECONDS}s")
-        status = (await client.runs.get(thread_id, run_id)).get("status")
-        if status in ("success", "error", "interrupted", "timeout"):
-            return status
-        await asyncio.sleep(5)
-
-
-async def _extract_report(client, thread_id: str) -> str:
-    state = await client.threads.get_state(thread_id)
-    values = state.get("values", {}) if isinstance(state, dict) else {}
-    report = values.get("final_report") or ""
-    if not report:
-        msgs = values.get("messages", [])
-        if msgs:
-            last = msgs[-1]
-            if isinstance(last, dict):
-                c = last.get("content")
-                if isinstance(c, list):
-                    c = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c)
-                report = c or ""
-            else:
-                report = str(last)
-    if not report:
-        raise RuntimeError("no report in final state")
-    return report
-
-
-async def _run_research(query: str, thread_id: str | None = None, label_query: str | None = None):
-    """Background: run deep research on a thread (new or existing), save, persist."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    label = label_query or query
-    base = f"{ts}_{slug(label)}"
-    try:
-        client = get_client(url=LANGGRAPH_URL)
-        if thread_id is None:
-            thread = await client.threads.create()
-            thread_id = thread["thread_id"]
-        log.info("thread=%s query=%r", thread_id, query)
-
-        run = await client.runs.create(
-            thread_id=thread_id,
-            assistant_id=ASSISTANT_ID,
-            input={"messages": [{"role": "user", "content": query}]},
-        )
-        run_id = run["run_id"]
-
-        status = await _await_run(client, thread_id, run_id)
-        if status != "success":
-            raise RuntimeError(f"run status={status}")
-        report = await _extract_report(client, thread_id)
-        await _save_report(query=label, report=report, thread_id=thread_id, ts=ts, base=base)
-    except Exception as e:
-        err_path = ERRORS_DIR / f"{base}.err"
-        err_path.write_text(f"query: {query}\n\n{traceback.format_exc()}")
-        log.error("research failed: %s (see %s)", e, err_path)
-
-
 _rate_buckets: dict[str, tuple[int, int]] = defaultdict(lambda: (0, 0))
 def _rate_gate(ip: str) -> None:
     now_min = int(time.time() // 60)
@@ -286,10 +175,23 @@ def _safe_report_path(name: str) -> Path:
     return p
 
 
-CONTINUE_WRAPPER = (
-    "Revise and extend your prior research. Follow-up from the user: {instr}. "
-    "Re-plan sub-questions if needed and produce an updated final_report."
-)
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _summarize_title(question: str) -> str:
+    """First sentence (or first 80 chars) of the question, sanitized for a title row."""
+    q = (question or "").strip().replace("\n", " ")
+    head = re.split(r"(?<=[.?!])\s+", q, maxsplit=1)[0] if q else "Untitled"
+    return (head[:80] or "Untitled").rstrip()
+
+
+def _audit_log(record: dict) -> None:
+    try:
+        with AUDIT_LOG_PATH.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        log.exception("audit log write failed")
 
 
 @app.get("/")
@@ -365,65 +267,30 @@ async def delete_corpus(report_id: str):
 
 @app.get("/threads", dependencies=[Depends(check_auth)])
 async def threads_list(limit: int = 20):
-    client = get_client(url=LANGGRAPH_URL)
-    tlist = await client.threads.search(limit=max(1, min(limit, 100)))
-    out = []
-    for t in tlist:
-        tid = t.get("thread_id")
-        created = t.get("created_at", "")
-        query = ""
-        has_report = False
-        try:
-            state = await client.threads.get_state(tid)
-            values = state.get("values", {}) if isinstance(state, dict) else {}
-            for m in values.get("messages", []) or []:
-                if not isinstance(m, dict):
-                    continue
-                if m.get("type") == "human" or m.get("role") == "user":
-                    c = m.get("content")
-                    if isinstance(c, list):
-                        c = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c)
-                    query = c if isinstance(c, str) else str(c)
-                    break
-            has_report = bool(values.get("final_report"))
-        except Exception as e:
-            log.warning("thread %s state fetch failed: %s", tid, e)
-        out.append({
-            "thread_id": tid,
-            "created_at": created,
-            "query": (query or "")[:240],
-            "has_report": has_report,
-        })
-    return out
+    return courses_db.list_ask_threads(limit=max(1, min(limit, 200)))
 
 
 @app.get("/threads/{thread_id}", dependencies=[Depends(check_auth)])
 async def thread_detail(thread_id: str):
-    client = get_client(url=LANGGRAPH_URL)
-    state = await client.threads.get_state(thread_id)
-    values = state.get("values", {}) if isinstance(state, dict) else {}
-    msgs_raw = values.get("messages", []) or []
-    msgs = []
-    for m in msgs_raw:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role") or m.get("type") or ""
-        content = m.get("content")
-        if isinstance(content, list):
-            content = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
-        msgs.append({"role": role, "content": content or ""})
-    return {
-        "thread_id": thread_id,
-        "messages": msgs,
-        "final_report": values.get("final_report", "") or "",
-    }
+    t = courses_db.get_ask_thread(thread_id)
+    if not t:
+        raise HTTPException(404, "thread not found")
+    return t
 
 
-@app.post("/threads/{thread_id}/continue", dependencies=[Depends(check_auth)])
-async def thread_continue(thread_id: str, req: ContinueRequest, bg: BackgroundTasks):
-    wrapped = CONTINUE_WRAPPER.format(instr=req.instruction)
-    bg.add_task(_run_research, wrapped, thread_id, req.instruction)
-    return {"status": "accepted", "thread_id": thread_id, "instruction": req.instruction}
+@app.delete("/threads/{thread_id}", dependencies=[Depends(check_auth)])
+async def delete_thread(thread_id: str):
+    if not courses_db.delete_ask_thread(thread_id):
+        raise HTTPException(404, "thread not found")
+    return {"deleted": thread_id}
+
+
+@app.post("/threads/{thread_id}/ask", dependencies=[Depends(check_auth)])
+async def thread_ask(thread_id: str, req: AskRequest):
+    if not courses_db.get_ask_thread(thread_id):
+        raise HTTPException(404, "thread not found")
+    req.thread_id = thread_id
+    return await _ask_kickoff(req)
 
 
 @app.get("/search2", dependencies=[Depends(check_auth)])
@@ -498,25 +365,285 @@ async def ingest(req: IngestRequest):
     }
 
 
-@app.post("/research", dependencies=[Depends(check_auth)])
-async def research(req: ResearchRequest, bg: BackgroundTasks):
-    existing = []
-    if LLAMAINDEX_ENABLED:
+# ---- Ask flow: POST /ask + /ask_callback + GET /ask_runs/{run_id} ----------
+
+_ask_runs: dict[str, dict] = {}
+_ask_runs_lock = asyncio.Lock()
+_pool_full_at: float = 0.0  # epoch seconds; cooldown window for cloud route
+
+
+async def _evict_old_ask_runs() -> None:
+    cutoff = time.time() - ASK_RUN_TTL
+    async with _ask_runs_lock:
+        stale = [k for k, v in _ask_runs.items()
+                 if v.get("finished_at") and v["finished_at"] < cutoff]
+        for k in stale:
+            _ask_runs.pop(k, None)
+
+
+def _pool_full_recently() -> bool:
+    return (time.time() - _pool_full_at) < POOL_FULL_COOLDOWN_S
+
+
+async def _pick_ask_route(mode: str) -> str:
+    if mode == "cloud":
+        return "cloud"
+    if mode == "local":
+        return "local"
+    if not ANTHROPIC_OAT or not ROUTINE_INGEST_ASK_FIRE_URL:
+        return "local"  # cloud not configured; auto → local
+    if _pool_full_recently():
+        return "local"
+    return "cloud"
+
+
+async def _fire_ask_routine(payload: dict, run_id: str) -> None:
+    global _pool_full_at
+    headers = {
+        "Authorization": f"Bearer {ANTHROPIC_OAT}",
+        "anthropic-beta": ROUTINE_FIRE_BETA,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    body = {"text": json.dumps(payload)}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(ROUTINE_INGEST_ASK_FIRE_URL, headers=headers, json=body)
+    except httpx.HTTPError as e:
+        await _ask_fail(run_id, f"routine fire transport: {e}")
+        return
+    pool_full = (
+        r.status_code in (429, 503)
+        or "pool" in r.text.lower()
+        or "capacity" in r.text.lower()
+    )
+    if pool_full:
+        _pool_full_at = time.time()
+        log.warning("routine pool full; falling back to local skill (run=%s)", run_id)
+        await _fire_ask_local_skill(payload, run_id, fallback_from_cloud=True)
+        return
+    if r.status_code >= 400:
+        await _ask_fail(run_id, f"routine fire {r.status_code}: {r.text[:300]}")
+        return
+    try:
+        body_json = r.json()
+        async with _ask_runs_lock:
+            run = _ask_runs.get(run_id)
+            if run is not None:
+                run["claude_session_url"] = body_json.get("claude_code_session_url")
+    except Exception:
+        log.exception("routine fire response parse failed (continuing)")
+
+
+async def _fire_ask_local_skill(payload: dict, run_id: str, *, fallback_from_cloud: bool = False) -> None:
+    if fallback_from_cloud:
+        async with _ask_runs_lock:
+            run = _ask_runs.get(run_id)
+            if run is not None:
+                run["route"] = "local"
+                if run.get("turn_id"):
+                    courses_db.update_ask_turn_route(run["turn_id"], "local")
+    arg = json.dumps(payload)
+    cmd = [
+        "sudo", "-n", "-u", CLAUDE_FALLBACK_USER, CLAUDE_BIN,
+        "-p", f"/ingest-ask {arg}",
+        "--allowedTools", "WebSearch,WebFetch,Bash",
+        "--permission-mode", "bypassPermissions",
+    ]
+    env = {
+        "WEBHOOK_URL": "http://127.0.0.1:8000",
+        "WEBHOOK_API_KEY": API_KEY,
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": f"/home/{CLAUDE_FALLBACK_USER}",
+    }
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, env=env, cwd="/tmp",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        await _ask_fail(run_id, f"claude binary not found at {CLAUDE_BIN}")
+        return
+    except PermissionError as e:
+        await _ask_fail(run_id, f"sudo to {CLAUDE_FALLBACK_USER} denied: {e}")
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=CLAUDE_FALLBACK_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await _ask_fail(run_id, f"local skill timed out after {CLAUDE_FALLBACK_TIMEOUT}s")
+        return
+    if proc.returncode != 0:
+        # Skill itself should always send /ask_callback. If it exits non-zero before
+        # callback fires, mark failed; if callback already arrived, _ask_fail no-ops.
         try:
-            hits = await _li().retrieve(req.query, k=3, hybrid=True, rerank=False)
-            existing = [{
-                "query": h.get("query", ""),
-                "preview": (h.get("text", "") or "")[:240],
-                "report_id": h.get("report_id", ""),
-                "score": h.get("score", 0.0),
-            } for h in hits]
+            err = (await proc.stderr.read()).decode(errors="replace")[:300]
         except Exception:
-            log.exception("existing-match retrieve failed")
-    bg.add_task(_run_research, req.query)
+            err = "subprocess returned non-zero"
+        await _ask_fail(run_id, f"local skill rc={proc.returncode}: {err}")
+
+
+async def _ask_fail(run_id: str, message: str) -> None:
+    async with _ask_runs_lock:
+        run = _ask_runs.get(run_id)
+        if not run or run.get("status") in ("complete", "failed"):
+            return
+        run["status"] = "failed"
+        run["finished_at"] = time.time()
+        run["errors"].append({"message": message})
+    log.warning("ask run %s failed: %s", run_id, message)
+
+
+async def _ask_kickoff(req: AskRequest) -> dict:
+    """Shared entry point for POST /ask and POST /threads/{id}/ask."""
+    if not LLAMAINDEX_ENABLED:
+        raise HTTPException(503, "llamaindex disabled")
+    q = (req.question or "").strip()
+    urls = list(req.urls or [])
+    if not q and not urls:
+        raise HTTPException(400, "question or urls required")
+
+    thread_id = req.thread_id or courses_db.create_ask_thread(
+        title=_summarize_title(q or "URL ingest"),
+    )
+    run_id = "ask_" + secrets.token_hex(8)
+    max_fetches = max(1, min(int(req.max_fetches or ASK_DEFAULT_MAX_FETCHES), 25))
+    payload = {
+        "run_id": run_id,
+        "question": q,
+        "thread_id": thread_id,
+        "max_fetches": max_fetches,
+        "topic": (req.topic or "").strip(),
+        "urls": urls,
+    }
+
+    route = await _pick_ask_route(req.mode)
+    turn_id = courses_db.add_ask_turn(thread_id, q or "(urls)", route, run_id)
+
+    async with _ask_runs_lock:
+        _ask_runs[run_id] = {
+            "run_id": run_id,
+            "status": "pending",
+            "route": route,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "question": q,
+            "ingested": [],
+            "skipped": [],
+            "errors": [],
+            "synthesis": None,
+            "started_at": time.time(),
+        }
+
+    _audit_log({
+        "ts": _now_iso(), "run_id": run_id, "route": route,
+        "thread_id": thread_id, "turn_id": turn_id,
+        "q_prefix": q[:80],
+    })
+
+    if route == "cloud":
+        asyncio.create_task(_fire_ask_routine(payload, run_id))
+    else:
+        asyncio.create_task(_fire_ask_local_skill(payload, run_id))
+
+    return {"run_id": run_id, "thread_id": thread_id, "turn_id": turn_id, "route": route}
+
+
+@app.post("/ask", dependencies=[Depends(check_auth)])
+async def ask(req: AskRequest):
+    return await _ask_kickoff(req)
+
+
+@app.post("/ask_callback", dependencies=[Depends(check_auth)])
+async def ask_callback(cb: AskCallback):
+    async with _ask_runs_lock:
+        run = _ask_runs.get(cb.run_id)
+        if run is None:
+            return {"ok": False, "reason": "unknown run_id"}
+        if run.get("status") in ("complete", "failed"):
+            return {"ok": True, "noop": True}
+        run["ingested"] = cb.ingested or []
+        run["skipped"] = cb.skipped or []
+        run["errors"] = list(run.get("errors", [])) + (cb.errors or [])
+        run["status"] = "synthesizing"
+        question = run.get("question") or ""
+        turn_id = run.get("turn_id")
+
+    syn: dict | None = None
+    syn_error: str | None = None
+    if question.strip():
+        try:
+            syn = await _li().synthesize(question, k=8, rerank=True, subq=False)
+        except Exception as e:
+            log.exception("synthesis failed for run=%s", cb.run_id)
+            syn_error = str(e)
+
+    async with _ask_runs_lock:
+        run = _ask_runs.get(cb.run_id)
+        if run is not None:
+            run["synthesis"] = syn
+            run["status"] = "complete" if cb.status == "complete" else "failed"
+            if syn_error:
+                run["errors"].append({"message": f"synthesis: {syn_error}"})
+            run["finished_at"] = time.time()
+
+    if turn_id:
+        try:
+            courses_db.update_ask_turn(
+                turn_id,
+                ingested_doc_ids=[i.get("doc_id") for i in (cb.ingested or []) if i.get("doc_id")],
+                answer_md=(syn or {}).get("answer", ""),
+                citations=(syn or {}).get("citations", []),
+            )
+        except Exception:
+            log.exception("ask_turn persist failed run=%s turn=%s", cb.run_id, turn_id)
+
+    asyncio.create_task(_evict_old_ask_runs())
+    return {"ok": True}
+
+
+@app.get("/ask_runs/{run_id}", dependencies=[Depends(check_auth)])
+async def ask_run_status(run_id: str):
+    async with _ask_runs_lock:
+        run = _ask_runs.get(run_id)
+    if not run:
+        # Fall back to the persisted turn if the in-memory run was evicted.
+        with courses_db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT id, thread_id, route, answer_md, citations_json, "
+                "ingested_doc_ids_json, created_at FROM ask_turns WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(404, "run not found (expired or never existed)")
+        return {
+            "run_id": run_id,
+            "status": "complete" if row["answer_md"] else "expired",
+            "route": row["route"],
+            "thread_id": row["thread_id"],
+            "turn_id": row["id"],
+            "ingested": [{"doc_id": d} for d in json.loads(row["ingested_doc_ids_json"] or "[]")],
+            "skipped": [],
+            "errors": [],
+            "synthesis": ({
+                "answer": row["answer_md"],
+                "citations": json.loads(row["citations_json"] or "[]"),
+            } if row["answer_md"] else None),
+        }
     return {
-        "status": "accepted",
-        "query": req.query,
-        "existing_matches": existing,
+        "run_id": run_id,
+        "status": run["status"],
+        "route": run["route"],
+        "thread_id": run["thread_id"],
+        "turn_id": run["turn_id"],
+        "ingested": run.get("ingested", []),
+        "skipped": run.get("skipped", []),
+        "errors": run.get("errors", []),
+        "synthesis": run.get("synthesis"),
+        "started_at": run.get("started_at"),
+        "finished_at": run.get("finished_at"),
+        "claude_code_session_url": run.get("claude_session_url"),
     }
 
 

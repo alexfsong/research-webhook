@@ -203,10 +203,44 @@ sudo systemctl reload caddy
 
 | Path | Owner app |
 |------|-----------|
-| `~/research-data/courses.db` | research-webhook |
+| `~/research-data/courses.db` | research-webhook (SQLite: courses, lessons, follow_ups, ask_threads, ask_turns) |
 | `~/research-data/chroma/` | research-webhook |
-| `~/research-data/reports/` | research-webhook |
+| `~/research-data/reports/` | research-webhook (legacy ODR reports — read-only post Ask-pivot) |
 | `~/research-data/hf-cache/` | research-webhook (HuggingFace models) |
+| `~/research-data/ask-audit.log` | research-webhook (one JSON line per /ask) |
+
+## Subscription fallback runner
+
+A locked-down `claude-runner` Linux user holds a per-user `npm`-prefixed Claude
+Code install logged in with a Pro/Max subscription OAT. The webhook invokes it
+via `sudo -n -u claude-runner /home/claude-runner/.npm-global/bin/claude -p
+"/ingest-ask <json>"` (NOPASSWD limited to that single binary) when the cloud
+routine pool is exhausted.
+
+- Slash command lives at
+  `/home/claude-runner/.claude/commands/ingest-ask.md` (NOT `skills/` — Claude
+  Code only fires `/name` syntax against `commands/<name>.md`). Source-controlled
+  in the [agentic-research-play](https://github.com/alexfsong/agentic-research-play)
+  companion repo at `.claude/commands/ingest-ask.md`.
+- Sudoers entry (`/etc/sudoers.d/claude-runner`, chmod 440, root:root):
+  ```
+  Defaults>claude-runner env_keep += "WEBHOOK_URL WEBHOOK_API_KEY"
+  researcher ALL=(claude-runner) NOPASSWD: /home/claude-runner/.npm-global/bin/claude
+  ```
+  The `env_keep` line is required — without it, `sudo` strips
+  `WEBHOOK_URL`/`WEBHOOK_API_KEY` from the environment and the skill exits with
+  "WEBHOOK_URL not set".
+- Subprocess invoked with `--allowedTools "WebSearch,WebFetch,Bash"` and
+  `--permission-mode bypassPermissions`. The `bypassPermissions` mode is
+  required for non-interactive `-p` use (otherwise the model auto-denies tool
+  prompts and Bash/curl is blocked); the `--allowedTools` whitelist is the real
+  safety boundary. No Edit / Write / Read of arbitrary files.
+- The `CLAUDE_BIN` env var in `/home/researcher/research-webhook/.env` MUST
+  match the sudoers `Cmnd` line byte-for-byte. Path mismatch → password prompt
+  → webhook fallback fails.
+- Rotate the OAT every 90 days
+  (`sudo -i -u claude-runner claude logout` → `claude login`).
+- `claude-runner` has no sudo, no shell login, no docker membership.
 
 Back up this directory if data matters. Nothing in `/home/researcher/<app>/` is
 intended to be persistent beyond a `git pull`.
