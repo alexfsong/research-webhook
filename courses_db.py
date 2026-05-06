@@ -116,6 +116,30 @@ SCHEMA = [
       PRIMARY KEY(user_id, course_id, lesson_id)
     )
     """,
+    # --- ask_threads (Ask-pivot: ODR /research replacement) ---
+    """
+    CREATE TABLE IF NOT EXISTS ask_threads (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ask_turns (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL REFERENCES ask_threads(id) ON DELETE CASCADE,
+      idx INTEGER NOT NULL,
+      question TEXT NOT NULL,
+      route TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      ingested_doc_ids_json TEXT NOT NULL DEFAULT '[]',
+      answer_md TEXT,
+      citations_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      UNIQUE(thread_id, idx)
+    )
+    """,
     # --- indexes ---
     "CREATE INDEX IF NOT EXISTS idx_lessons_course ON lessons(course_id, idx)",
     "CREATE INDEX IF NOT EXISTS idx_modules_course ON modules(course_id, idx)",
@@ -125,6 +149,9 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_cards_course ON cards(course_id)",
     "CREATE INDEX IF NOT EXISTS idx_reviews_card ON reviews(card_id, reviewed_at)",
     "CREATE INDEX IF NOT EXISTS idx_reviews_user ON reviews(user_id, reviewed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ask_threads_updated ON ask_threads(updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_ask_turns_thread ON ask_turns(thread_id, idx)",
+    "CREATE INDEX IF NOT EXISTS idx_ask_turns_run ON ask_turns(run_id)",
 ]
 
 
@@ -425,6 +452,126 @@ def get_status(course_id: str) -> dict | None:
             (course_id,),
         ).fetchone()
     return dict(r) if r else None
+
+
+# ------------------------------------------------------------------------- #
+# ask_threads / ask_turns DAO — backs POST /ask + Conversations tab.
+# ------------------------------------------------------------------------- #
+
+def create_ask_thread(title: str) -> str:
+    tid = _new_id("thr")
+    now = _now()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO ask_threads(id,title,created_at,updated_at) VALUES (?,?,?,?)",
+            (tid, title, now, now),
+        )
+    return tid
+
+
+def add_ask_turn(thread_id: str, question: str, route: str, run_id: str) -> str:
+    """Append a new turn. Returns turn_id; bumps thread updated_at."""
+    tnid = _new_id("turn")
+    now = _now()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(idx), -1) AS m FROM ask_turns WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+        next_idx = (row["m"] if row and row["m"] is not None else -1) + 1
+        conn.execute(
+            "INSERT INTO ask_turns(id,thread_id,idx,question,route,run_id,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (tnid, thread_id, next_idx, question, route, run_id, now),
+        )
+        conn.execute(
+            "UPDATE ask_threads SET updated_at=? WHERE id=?", (now, thread_id),
+        )
+    return tnid
+
+
+def update_ask_turn(
+    turn_id: str,
+    *,
+    ingested_doc_ids: list | None = None,
+    answer_md: str | None = None,
+    citations: list | None = None,
+) -> None:
+    fields: dict = {}
+    if ingested_doc_ids is not None:
+        fields["ingested_doc_ids_json"] = json.dumps(ingested_doc_ids)
+    if answer_md is not None:
+        fields["answer_md"] = answer_md
+    if citations is not None:
+        fields["citations_json"] = json.dumps(citations)
+    if not fields:
+        return
+    cols = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [turn_id]
+    with get_conn() as conn:
+        conn.execute(f"UPDATE ask_turns SET {cols} WHERE id=?", vals)
+
+
+def update_ask_turn_route(turn_id: str, route: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE ask_turns SET route=? WHERE id=?", (route, turn_id))
+
+
+def get_ask_turn(turn_id: str) -> dict | None:
+    with get_conn() as conn:
+        r = conn.execute("SELECT * FROM ask_turns WHERE id=?", (turn_id,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    d["ingested_doc_ids"] = json.loads(d.pop("ingested_doc_ids_json") or "[]")
+    d["citations"] = json.loads(d.pop("citations_json") or "[]")
+    return d
+
+
+def get_ask_turn_question(turn_id: str) -> str | None:
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT question FROM ask_turns WHERE id=?", (turn_id,),
+        ).fetchone()
+    return r["question"] if r else None
+
+
+def get_ask_thread(thread_id: str) -> dict | None:
+    with get_conn() as conn:
+        t = conn.execute(
+            "SELECT * FROM ask_threads WHERE id=?", (thread_id,),
+        ).fetchone()
+        if not t:
+            return None
+        rows = conn.execute(
+            "SELECT * FROM ask_turns WHERE thread_id=? ORDER BY idx", (thread_id,),
+        ).fetchall()
+    out = dict(t)
+    turns = []
+    for r in rows:
+        d = dict(r)
+        d["ingested_doc_ids"] = json.loads(d.pop("ingested_doc_ids_json") or "[]")
+        d["citations"] = json.loads(d.pop("citations_json") or "[]")
+        turns.append(d)
+    out["turns"] = turns
+    return out
+
+
+def list_ask_threads(limit: int = 50) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT t.id, t.title, t.created_at, t.updated_at, "
+            "       (SELECT COUNT(*) FROM ask_turns WHERE thread_id=t.id) AS turn_count "
+            "FROM ask_threads t ORDER BY t.updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_ask_thread(thread_id: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM ask_threads WHERE id=?", (thread_id,))
+        return cur.rowcount > 0
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 [Unit]
 Description=Research webhook API (FastAPI)
-After=network-online.target research-agent.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -9,9 +9,9 @@ User=researcher
 Group=researcher
 WorkingDirectory=/home/researcher/research-webhook
 EnvironmentFile=/home/researcher/research-webhook/.env
-# WEBHOOK_API_KEY, ANTHROPIC_OAT, ROUTINE_RESEARCH_FIRE_URL etc. live in .env.
-# .env should be chmod 600 and owned by researcher.
-ExecStart=/home/researcher/open_deep_research/.venv/bin/uvicorn webhook:app --host 127.0.0.1 --port 8000
+# Secrets (WEBHOOK_API_KEY, ANTHROPIC_OAT, ROUTINE_*_FIRE_URL, etc.) live in
+# .env. Chmod 600 and owned by researcher. See INFRA.md.
+ExecStart=/home/researcher/research-webhook/.venv/bin/uvicorn webhook:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=10
 StandardOutput=journal

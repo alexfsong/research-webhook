@@ -56,33 +56,88 @@
 
   function setLoading() { view.innerHTML = `<div class="meta"><span class="spinner"></span>loading…</div>`; }
 
+  function renderAskAnswer(syn) {
+    if (!syn || !syn.answer) return "";
+    const cites = (syn.citations || []).map((c, i) => {
+      const n = c.n ?? (i + 1);
+      return `
+        <div class="card">
+          <div class="meta">[${n}] ${esc(fmtDate(c.date || ""))} · ${esc(c.query || "")}${c.thread_id ? ` · <a href="#/threads/${encodeURIComponent(c.thread_id)}">thread</a>` : ""}${c.score != null ? ` · score ${c.score.toFixed(3)}` : ""}</div>
+          <pre>${esc(c.snippet || "")}</pre>
+        </div>`;
+    }).join("");
+    return `
+      <div class="report" style="margin-top:12px">${marked.parse(syn.answer)}</div>
+      ${cites ? `<details style="margin-top:8px"><summary class="meta">Citations (${syn.citations.length})</summary>${cites}</details>` : ""}`;
+  }
+
+  async function pollAskRun(runId, { intervalMs = 2000, maxMs = 240000 } = {}) {
+    const start = Date.now();
+    while (Date.now() - start < maxMs) {
+      const r = await api(`/ask_runs/${encodeURIComponent(runId)}`);
+      if (r.status === "complete" || r.status === "failed" || r.status === "expired") return r;
+      await new Promise((res) => setTimeout(res, intervalMs));
+    }
+    throw new Error("ask polling timed out");
+  }
+
+  async function submitAsk({ thread_id = null, q, mode, statusEl, answerEl, badgeEl }) {
+    const path = thread_id ? `/threads/${encodeURIComponent(thread_id)}/ask` : "/ask";
+    statusEl.innerHTML = `<span class="spinner"></span>queuing…`;
+    if (badgeEl) badgeEl.textContent = "";
+    if (answerEl) answerEl.innerHTML = "";
+    let r;
+    try {
+      r = await api(path, { method: "POST", body: JSON.stringify({ question: q, mode }) });
+    } catch (e) { toast(e.message, "err"); statusEl.textContent = ""; return null; }
+    statusEl.innerHTML = `<span class="spinner"></span>via ${esc(r.route)} · ingesting…`;
+    try {
+      const result = await pollAskRun(r.run_id);
+      if (result.status === "failed") {
+        const msg = (result.errors && result.errors[0] && result.errors[0].message) || "ask failed";
+        statusEl.textContent = `failed: ${msg}`;
+        return null;
+      }
+      const n = (result.ingested || []).length;
+      if (badgeEl) badgeEl.textContent = n > 0 ? `+${n} fetched` : "no new docs";
+      statusEl.textContent = `via ${result.route}`;
+      if (answerEl) answerEl.innerHTML = renderAskAnswer(result.synthesis);
+      return Object.assign({}, r, { result });
+    } catch (e) { toast(e.message, "err"); statusEl.textContent = ""; return null; }
+  }
+
   async function viewAsk() {
     view.innerHTML = `
       <div class="card">
-        <h3>New research</h3>
-        <div class="meta">Kicks off a deep research run. Reports drop into Reports in a few minutes.</div>
+        <h3>Ask</h3>
+        <div class="meta">Fetches sources, ingests them, then synthesizes a cited answer.</div>
         <textarea id="ask-q" placeholder="e.g. compare LightRAG and GraphRAG for evaluation robustness"></textarea>
-        <div style="margin-top:10px" class="row"><button id="ask-go">Ask</button><span id="ask-status" class="meta"></span></div>
+        <div class="row" style="margin-top:8px;gap:14px;flex-wrap:wrap">
+          <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="auto" checked> auto</label>
+          <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="cloud"> cloud</label>
+          <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="local"> my subscription</label>
+        </div>
+        <div class="row" style="margin-top:10px;gap:8px;align-items:center">
+          <button id="ask-go">Ask</button>
+          <span id="ask-status" class="meta"></span>
+          <span id="ask-badge" class="meta"></span>
+        </div>
       </div>
-      <div id="ask-existing"></div>`;
-    const go = async () => {
+      <div id="ask-answer"></div>`;
+    $("ask-go").addEventListener("click", async () => {
       const q = $("ask-q").value.trim(); if (!q) return;
-      $("ask-status").innerHTML = '<span class="spinner"></span>queuing…';
-      try {
-        const r = await api("/research", { method: "POST", body: JSON.stringify({ query: q }) });
-        $("ask-status").textContent = "queued. check Reports shortly.";
-        $("ask-q").value = "";
-        if (r.existing_matches && r.existing_matches.length) {
-          $("ask-existing").innerHTML = `<h3 style="margin:20px 0 8px">Related prior work</h3>` +
-            r.existing_matches.map((m) => `
-              <div class="card">
-                <div class="meta">${esc(m.query || "")}${m.score != null ? ` · score ${m.score.toFixed(3)}` : ""}</div>
-                <pre>${esc(m.preview)}</pre>
-              </div>`).join("");
-        }
-      } catch (e) { toast(e.message, "err"); $("ask-status").textContent = ""; }
-    };
-    $("ask-go").addEventListener("click", go);
+      const mode = (document.querySelector('input[name="ask-mode"]:checked') || {}).value || "auto";
+      const r = await submitAsk({
+        q, mode,
+        statusEl: $("ask-status"),
+        answerEl: $("ask-answer"),
+        badgeEl: $("ask-badge"),
+      });
+      if (r && r.thread_id) {
+        // Land the user inside the conversation so they can keep going.
+        location.hash = `#/threads/${encodeURIComponent(r.thread_id)}`;
+      }
+    });
   }
 
   async function viewReports() {
@@ -143,91 +198,92 @@
     $("s-q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   }
 
-  function renderSynthResult(r) {
-    const cites = (r.citations || []).map((c, i) => {
-      const n = c.n ?? (i + 1);
-      return `
-        <div class="card">
-          <div class="meta">[${n}] ${esc(fmtDate(c.date || ""))} · ${esc(c.query || "")}${c.thread_id ? ` · <a href="#/threads/${encodeURIComponent(c.thread_id)}">thread</a>` : ""}${c.score != null ? ` · score ${c.score.toFixed(3)}` : ""}</div>
-          <pre>${esc(c.snippet || "")}</pre>
-        </div>`;
-    }).join("");
-    return `
-      <div class="report" style="margin-top:12px">${marked.parse(r.answer || "")}</div>
-      ${cites ? `<h3 style="margin:18px 0 8px">Citations</h3>${cites}` : ""}`;
-  }
-
-  async function viewSynthesize() {
-    view.innerHTML = `
-      <div class="card">
-        <h3>Synthesize across reports</h3>
-        <div class="meta">Top excerpts + Claude answer with citations.</div>
-        <textarea id="sy-q" placeholder="what do my reports say about X?"></textarea>
-        <div style="margin-top:10px" class="row">
-          <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="sy-subq">sub-questions</label>
-          <button id="sy-go">Ask</button>
-          <span id="sy-status" class="meta"></span>
-        </div>
-      </div>
-      <div id="sy-out"></div>`;
-    $("sy-go").addEventListener("click", async () => {
-      const q = $("sy-q").value.trim(); if (!q) return;
-      const subq = $("sy-subq").checked;
-      $("sy-status").innerHTML = '<span class="spinner"></span>synthesizing…';
-      try {
-        const r = await api("/synthesize2", {
-          method: "POST",
-          body: JSON.stringify({ question: q, k: 8, rerank: true, subq }),
-        });
-        $("sy-status").textContent = r.engine ? `(${r.model || ""} · ${r.engine})` : (r.model ? `(${r.model})` : "");
-        $("sy-out").innerHTML = renderSynthResult(r);
-      } catch (e) { toast(e.message, "err"); $("sy-status").textContent = ""; }
-    });
-  }
-
   async function viewThreads() {
     setLoading();
     try {
-      const list = await api("/threads?limit=30");
-      if (!list.length) { view.innerHTML = `<p class="meta">No threads yet.</p>`; return; }
+      const list = await api("/threads?limit=50");
+      if (!list.length) { view.innerHTML = `<p class="meta">No conversations yet. Start one from the <a href="#/ask">Ask</a> tab.</p>`; return; }
       view.innerHTML = list.map((t) => `
-        <a class="card" style="display:block" href="#/threads/${encodeURIComponent(t.thread_id)}">
-          <h3>${esc(t.query || "(untitled)")}</h3>
-          <div class="meta">${esc(fmtDate(t.created_at))}${t.has_report ? " · has report" : ""}</div>
+        <a class="card" style="display:block" href="#/threads/${encodeURIComponent(t.id)}">
+          <h3>${esc(t.title || "(untitled)")}</h3>
+          <div class="meta">${esc(fmtDate(t.updated_at))} · ${t.turn_count} turn${t.turn_count === 1 ? "" : "s"}</div>
         </a>`).join("");
     } catch (e) { toast(e.message, "err"); view.innerHTML = ""; }
+  }
+
+  function turnCard(turn) {
+    const route = turn.route ? `<span class="meta">via ${esc(turn.route)}</span>` : "";
+    const docCount = (turn.ingested_doc_ids || []).length;
+    const ingest = docCount ? `<span class="meta">· +${docCount} fetched</span>` : "";
+    const cites = (turn.citations || []).length;
+    const citeBlock = cites
+      ? `<details style="margin-top:8px"><summary class="meta">Citations (${cites})</summary>${
+          (turn.citations || []).map((c, i) => `
+            <div class="card" style="margin-top:6px">
+              <div class="meta">[${c.n ?? (i + 1)}] ${esc(c.query || "")}${c.thread_id ? ` · <a href="#/threads/${encodeURIComponent(c.thread_id)}">thread</a>` : ""}${c.score != null ? ` · ${c.score.toFixed(3)}` : ""}</div>
+              <pre>${esc(c.snippet || "")}</pre>
+            </div>`).join("")
+        }</details>`
+      : "";
+    return `
+      <div class="card">
+        <div class="meta">${esc(fmtDate(turn.created_at))} ${route} ${ingest}</div>
+        <div style="margin-top:6px"><strong>Q:</strong> ${esc(turn.question || "")}</div>
+        ${turn.answer_md
+          ? `<div class="report" style="margin-top:8px">${marked.parse(turn.answer_md)}</div>`
+          : `<div class="meta" style="margin-top:8px">(no answer recorded)</div>`}
+        ${citeBlock}
+      </div>`;
   }
 
   async function viewThreadDetail(tid) {
     setLoading();
     try {
       const t = await api("/threads/" + encodeURIComponent(tid));
-      const msgs = (t.messages || []).map((m) => `
-        <div class="card"><div class="meta">${esc(m.role || "")}</div><pre>${esc(m.content || "")}</pre></div>`).join("");
+      const turnsHtml = (t.turns || []).map(turnCard).join("");
       view.innerHTML = `
-        <a href="#/threads" class="meta">&larr; all threads</a>
-        <div class="meta" style="margin:6px 0 14px">${esc(tid)}</div>
-        ${t.final_report
-          ? `<div class="report">${marked.parse(t.final_report)}</div>`
-          : `<p class="meta">No final report yet.</p>`}
-        <h3 style="margin:22px 0 8px">Continue this thread</h3>
-        <div class="card">
-          <textarea id="c-q" placeholder="follow-up: dig deeper into X, or explore Y angle"></textarea>
-          <div style="margin-top:10px" class="row"><button id="c-go">Continue</button><span id="c-status" class="meta"></span></div>
-          <div class="meta" style="margin-top:8px">A new report will appear under Reports when done.</div>
+        <div class="row" style="justify-content:space-between;align-items:flex-start">
+          <a href="#/threads" class="meta">&larr; all conversations</a>
+          <button id="c-delete" title="delete conversation">✕</button>
         </div>
-        <details><summary class="meta">Messages (${t.messages.length})</summary>${msgs}</details>`;
-      $("c-go").addEventListener("click", async () => {
-        const instr = $("c-q").value.trim(); if (!instr) return;
-        $("c-status").innerHTML = '<span class="spinner"></span>queuing…';
-        try {
-          await api(`/threads/${encodeURIComponent(tid)}/continue`, {
-            method: "POST", body: JSON.stringify({ instruction: instr }),
-          });
-          $("c-status").textContent = "queued.";
+        <h3 style="margin:8px 0 4px">${esc(t.title || "(untitled)")}</h3>
+        <div class="meta" style="margin-bottom:14px">${esc(fmtDate(t.updated_at))}</div>
+        ${turnsHtml || `<p class="meta">No turns yet.</p>`}
+        <div class="card" style="margin-top:18px">
+          <h3 style="margin:0 0 6px">Continue</h3>
+          <textarea id="c-q" placeholder="follow-up question — fetches more sources if needed"></textarea>
+          <div class="row" style="margin-top:8px;gap:14px;flex-wrap:wrap">
+            <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="auto" checked> auto</label>
+            <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="cloud"> cloud</label>
+            <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="local"> my subscription</label>
+          </div>
+          <div class="row" style="margin-top:10px;gap:8px;align-items:center">
+            <button id="c-go">Continue</button>
+            <span id="c-status" class="meta"></span>
+            <span id="c-badge" class="meta"></span>
+          </div>
+          <div id="c-answer"></div>
+        </div>`;
+      $("c-delete").onclick = async () => {
+        if (!confirm("Delete this conversation? Turns are removed; ingested docs stay in the corpus.")) return;
+        try { await api("/threads/" + encodeURIComponent(tid), { method: "DELETE" }); location.hash = "#/threads"; }
+        catch (e) { toast(e.message, "err"); }
+      };
+      $("c-go").onclick = async () => {
+        const q = $("c-q").value.trim(); if (!q) return;
+        const mode = (document.querySelector('input[name="c-mode"]:checked') || {}).value || "auto";
+        const r = await submitAsk({
+          thread_id: tid, q, mode,
+          statusEl: $("c-status"),
+          answerEl: $("c-answer"),
+          badgeEl: $("c-badge"),
+        });
+        if (r) {
           $("c-q").value = "";
-        } catch (e) { toast(e.message, "err"); $("c-status").textContent = ""; }
-      });
+          // refresh thread detail so the new turn lands in the list above
+          setTimeout(() => viewThreadDetail(tid), 600);
+        }
+      };
     } catch (e) { toast(e.message, "err"); view.innerHTML = ""; }
   }
 
@@ -622,7 +678,6 @@
     [/^#\/reports$/, viewReports],
     [/^#\/reports\/(.+)$/, (m) => viewReportDetail(decodeURIComponent(m[1]))],
     [/^#\/search$/, viewSearch],
-    [/^#\/synthesize$/, viewSynthesize],
     [/^#\/threads$/, viewThreads],
     [/^#\/threads\/(.+)$/, (m) => viewThreadDetail(decodeURIComponent(m[1]))],
     [/^#\/learn$/, viewCourses],
