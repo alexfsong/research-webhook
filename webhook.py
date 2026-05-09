@@ -42,6 +42,8 @@ ROUTINE_FIRE_BETA = os.environ.get("ROUTINE_FIRE_BETA", "experimental-cc-routine
 RESEARCH_RUN_TTL = int(os.environ.get("RESEARCH_RUN_TTL", "3600"))
 ASK_RUN_TTL = int(os.environ.get("ASK_RUN_TTL", "3600"))
 ASK_DEFAULT_MAX_FETCHES = int(os.environ.get("ASK_DEFAULT_MAX_FETCHES", "10"))
+ASK_HISTORY_MAX_TURNS = int(os.environ.get("ASK_HISTORY_MAX_TURNS", "4"))
+ASK_HISTORY_ANSWER_TRUNC = int(os.environ.get("ASK_HISTORY_ANSWER_TRUNC", "800"))
 CLAUDE_FALLBACK_USER = os.environ.get("CLAUDE_FALLBACK_USER", "claude-runner").strip()
 CLAUDE_FALLBACK_TIMEOUT = int(os.environ.get("CLAUDE_FALLBACK_TIMEOUT", "240"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/home/claude-runner/.npm-global/bin/claude").strip()
@@ -509,9 +511,24 @@ async def _ask_kickoff(req: AskRequest) -> dict:
     if not q and not urls:
         raise HTTPException(400, "question or urls required")
 
+    is_continuation = bool(req.thread_id)
     thread_id = req.thread_id or courses_db.create_ask_thread(
         title=_summarize_title(q or "URL ingest"),
     )
+    history: list[dict] = []
+    if is_continuation:
+        thread = courses_db.get_ask_thread(thread_id)
+        if thread:
+            for t in (thread.get("turns") or []):
+                a = (t.get("answer_md") or "").strip()
+                if not a:
+                    continue
+                if len(a) > ASK_HISTORY_ANSWER_TRUNC:
+                    a = a[:ASK_HISTORY_ANSWER_TRUNC].rstrip() + "…"
+                history.append({"q": t.get("question") or "", "a": a})
+            if len(history) > ASK_HISTORY_MAX_TURNS:
+                history = history[-ASK_HISTORY_MAX_TURNS:]
+
     run_id = "ask_" + secrets.token_hex(8)
     max_fetches = max(1, min(int(req.max_fetches or ASK_DEFAULT_MAX_FETCHES), 25))
     payload = {
@@ -521,6 +538,7 @@ async def _ask_kickoff(req: AskRequest) -> dict:
         "max_fetches": max_fetches,
         "topic": (req.topic or "").strip(),
         "urls": urls,
+        "history": history,
     }
 
     route = await _pick_ask_route(req.mode)
