@@ -73,7 +73,10 @@ def check_auth(authorization: str | None = Header(default=None)):
         return
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing bearer token")
-    if authorization.split(None, 1)[1].strip() != API_KEY:
+    parts = authorization.split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        raise HTTPException(401, "missing bearer token")
+    if parts[1].strip() != API_KEY:
         raise HTTPException(403, "invalid token")
 
 
@@ -100,6 +103,8 @@ class AskCallback(BaseModel):
     ingested: list[dict] = []
     skipped: list[dict] = []
     errors: list[dict] = []
+    answer_md: str = ""
+    citations: list[dict] = []
 
 
 class IngestRequest(BaseModel):
@@ -557,6 +562,11 @@ async def ask(req: AskRequest):
 
 @app.post("/ask_callback", dependencies=[Depends(check_auth)])
 async def ask_callback(cb: AskCallback):
+    syn = (
+        {"answer": cb.answer_md, "citations": cb.citations or []}
+        if cb.answer_md
+        else None
+    )
     async with _ask_runs_lock:
         run = _ask_runs.get(cb.run_id)
         if run is None:
@@ -566,35 +576,18 @@ async def ask_callback(cb: AskCallback):
         run["ingested"] = cb.ingested or []
         run["skipped"] = cb.skipped or []
         run["errors"] = list(run.get("errors", [])) + (cb.errors or [])
-        run["status"] = "synthesizing"
-        question = run.get("question") or ""
+        run["synthesis"] = syn
+        run["status"] = "complete" if cb.status == "complete" else "failed"
+        run["finished_at"] = time.time()
         turn_id = run.get("turn_id")
-
-    syn: dict | None = None
-    syn_error: str | None = None
-    if question.strip():
-        try:
-            syn = await _li().synthesize(question, k=8, rerank=True, subq=False)
-        except Exception as e:
-            log.exception("synthesis failed for run=%s", cb.run_id)
-            syn_error = str(e)
-
-    async with _ask_runs_lock:
-        run = _ask_runs.get(cb.run_id)
-        if run is not None:
-            run["synthesis"] = syn
-            run["status"] = "complete" if cb.status == "complete" else "failed"
-            if syn_error:
-                run["errors"].append({"message": f"synthesis: {syn_error}"})
-            run["finished_at"] = time.time()
 
     if turn_id:
         try:
             courses_db.update_ask_turn(
                 turn_id,
                 ingested_doc_ids=[i.get("doc_id") for i in (cb.ingested or []) if i.get("doc_id")],
-                answer_md=(syn or {}).get("answer", ""),
-                citations=(syn or {}).get("citations", []),
+                answer_md=cb.answer_md or "",
+                citations=cb.citations or [],
             )
         except Exception:
             log.exception("ask_turn persist failed run=%s turn=%s", cb.run_id, turn_id)
