@@ -81,29 +81,34 @@
     throw new Error("ask polling timed out");
   }
 
-  async function submitAsk({ thread_id = null, q, mode, statusEl, answerEl, badgeEl }) {
+  async function submitAsk({ thread_id = null, q, mode, triggerEl, statusEl, answerEl, badgeEl }) {
     const path = thread_id ? `/threads/${encodeURIComponent(thread_id)}/ask` : "/ask";
+    if (triggerEl) triggerEl.disabled = true;
     statusEl.innerHTML = `<span class="spinner"></span>queuing…`;
     if (badgeEl) badgeEl.textContent = "";
     if (answerEl) answerEl.innerHTML = "";
-    let r;
     try {
-      r = await api(path, { method: "POST", body: JSON.stringify({ question: q, mode }) });
-    } catch (e) { toast(e.message, "err"); statusEl.textContent = ""; return null; }
-    statusEl.innerHTML = `<span class="spinner"></span>via ${esc(r.route)} · ingesting…`;
-    try {
-      const result = await pollAskRun(r.run_id);
-      if (result.status === "failed") {
-        const msg = (result.errors && result.errors[0] && result.errors[0].message) || "ask failed";
-        statusEl.textContent = `failed: ${msg}`;
-        return null;
-      }
-      const n = (result.ingested || []).length;
-      if (badgeEl) badgeEl.textContent = n > 0 ? `+${n} fetched` : "no new docs";
-      statusEl.textContent = `via ${result.route}`;
-      if (answerEl) answerEl.innerHTML = renderAskAnswer(result.synthesis);
-      return Object.assign({}, r, { result });
-    } catch (e) { toast(e.message, "err"); statusEl.textContent = ""; return null; }
+      let r;
+      try {
+        r = await api(path, { method: "POST", body: JSON.stringify({ question: q, mode }) });
+      } catch (e) { toast(e.message, "err"); statusEl.textContent = ""; return null; }
+      statusEl.innerHTML = `<span class="spinner"></span>via ${esc(r.route)} · ingesting…`;
+      try {
+        const result = await pollAskRun(r.run_id);
+        if (result.status === "failed") {
+          const msg = (result.errors && result.errors[0] && result.errors[0].message) || "ask failed";
+          statusEl.textContent = `failed: ${msg}`;
+          return null;
+        }
+        const n = (result.ingested || []).length;
+        if (badgeEl) badgeEl.textContent = n > 0 ? `+${n} fetched` : "no new docs";
+        statusEl.textContent = `via ${result.route}`;
+        if (answerEl) answerEl.innerHTML = renderAskAnswer(result.synthesis);
+        return Object.assign({}, r, { result });
+      } catch (e) { toast(e.message, "err"); statusEl.textContent = ""; return null; }
+    } finally {
+      if (triggerEl) triggerEl.disabled = false;
+    }
   }
 
   async function viewAsk() {
@@ -112,10 +117,10 @@
         <h3>Ask</h3>
         <div class="meta">Fetches sources, ingests them, then synthesizes a cited answer.</div>
         <textarea id="ask-q" placeholder="e.g. compare LightRAG and GraphRAG for evaluation robustness"></textarea>
-        <div class="row" style="margin-top:8px;gap:14px;flex-wrap:wrap">
-          <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="auto" checked> auto</label>
-          <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="cloud"> cloud</label>
-          <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="local"> my subscription</label>
+        <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">
+          <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="auto" checked> auto</label>
+          <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="cloud"> cloud</label>
+          <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="local"> my subscription</label>
         </div>
         <div class="row" style="margin-top:10px;gap:8px;align-items:center">
           <button id="ask-go">Ask</button>
@@ -129,6 +134,7 @@
       const mode = (document.querySelector('input[name="ask-mode"]:checked') || {}).value || "auto";
       const r = await submitAsk({
         q, mode,
+        triggerEl: $("ask-go"),
         statusEl: $("ask-status"),
         answerEl: $("ask-answer"),
         badgeEl: $("ask-badge"),
@@ -252,10 +258,10 @@
         <div class="card" style="margin-top:18px">
           <h3 style="margin:0 0 6px">Continue</h3>
           <textarea id="c-q" placeholder="follow-up question — fetches more sources if needed"></textarea>
-          <div class="row" style="margin-top:8px;gap:14px;flex-wrap:wrap">
-            <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="auto" checked> auto</label>
-            <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="cloud"> cloud</label>
-            <label class="meta" style="display:flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="local"> my subscription</label>
+          <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">
+            <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="auto" checked> auto</label>
+            <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="cloud"> cloud</label>
+            <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="local"> my subscription</label>
           </div>
           <div class="row" style="margin-top:10px;gap:8px;align-items:center">
             <button id="c-go">Continue</button>
@@ -274,6 +280,7 @@
         const mode = (document.querySelector('input[name="c-mode"]:checked') || {}).value || "auto";
         const r = await submitAsk({
           thread_id: tid, q, mode,
+          triggerEl: $("c-go"),
           statusEl: $("c-status"),
           answerEl: $("c-answer"),
           badgeEl: $("c-badge"),
