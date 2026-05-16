@@ -56,45 +56,116 @@
 
   function setLoading() { view.innerHTML = `<div class="meta"><span class="spinner"></span>loading…</div>`; }
 
-  function renderAskAnswer(syn) {
-    if (!syn || !syn.answer) return "";
-    const cites = (syn.citations || []).map((c, i) => {
-      const n = c.n ?? (i + 1);
+  function _parseReportPayload(answer) {
+    if (!answer) return null;
+    try {
+      const j = JSON.parse(answer);
+      if (j && j.shape === "report") return j;
+    } catch (_) {}
+    return null;
+  }
+
+  function _citationCard(c, i) {
+    const n = c.n ?? (i + 1);
+    const titleOrQuery = c.title || c.query || "";
+    const link = c.url
+      ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(titleOrQuery)}</a>`
+      : esc(titleOrQuery);
+    const threadLink = c.thread_id ? ` · <a href="#/threads/${encodeURIComponent(c.thread_id)}">thread</a>` : "";
+    const scoreLabel = c.score != null ? ` · ${c.score.toFixed(3)}` : "";
+    return `
+      <div class="card" style="margin-top:6px">
+        <div class="meta">[${n}] ${link}${threadLink}${scoreLabel}</div>
+        ${c.snippet ? `<pre>${esc(c.snippet)}</pre>` : ""}
+      </div>`;
+  }
+
+  function renderReport(report) {
+    const toc = (report.toc || []).map((h, i) => `<li><a href="#sec-${i}">${esc(h)}</a></li>`).join("");
+    const sections = (report.sections || []).map((s, i) => {
+      const cites = (s.citations || []).map(_citationCard).join("");
       return `
-        <div class="card">
-          <div class="meta">[${n}] ${esc(fmtDate(c.date || ""))} · ${esc(c.query || "")}${c.thread_id ? ` · <a href="#/threads/${encodeURIComponent(c.thread_id)}">thread</a>` : ""}${c.score != null ? ` · score ${c.score.toFixed(3)}` : ""}</div>
-          <pre>${esc(c.snippet || "")}</pre>
+        <div class="card" style="margin-top:10px">
+          <h3 id="sec-${i}" style="margin:0 0 6px">${esc(s.heading || "")}</h3>
+          <div class="report">${marked.parse(s.body || "")}</div>
+          ${cites ? `<details style="margin-top:8px"><summary class="meta">Citations (${s.citations.length})</summary>${cites}</details>` : ""}
         </div>`;
     }).join("");
+    const termLabel = {
+      empty_gaps: "report complete (no remaining gaps)",
+      iteration_cap: "stopped at iteration cap — partial report",
+      token_cap: "stopped at token cap — partial report",
+    }[report.termination] || (report.termination ? String(report.termination) : "");
+    return `
+      <div class="card" style="margin-top:12px">
+        <div class="meta">Table of contents</div>
+        <ol style="margin:6px 0 0 18px">${toc}</ol>
+      </div>
+      ${sections}
+      ${termLabel ? `<div class="meta" style="margin-top:10px">${esc(termLabel)}</div>` : ""}`;
+  }
+
+  function renderAskAnswer(syn) {
+    if (!syn) return "";
+    if (syn.report) return renderReport(syn.report);
+    const reportFromAnswer = _parseReportPayload(syn.answer);
+    if (reportFromAnswer) return renderReport(reportFromAnswer);
+    if (!syn.answer) return "";
+    const cites = (syn.citations || []).map(_citationCard).join("");
     return `
       <div class="report" style="margin-top:12px">${marked.parse(syn.answer)}</div>
       ${cites ? `<details style="margin-top:8px"><summary class="meta">Citations (${syn.citations.length})</summary>${cites}</details>` : ""}`;
   }
 
-  async function pollAskRun(runId, { intervalMs = 2000, maxMs = 240000 } = {}) {
+  async function pollAskRun(runId, { intervalMs = 2000, maxMs = 240000, onStatus = null } = {}) {
     const start = Date.now();
     while (Date.now() - start < maxMs) {
       const r = await api(`/ask_runs/${encodeURIComponent(runId)}`);
       if (r.status === "complete" || r.status === "failed" || r.status === "expired") return r;
+      if (typeof onStatus === "function") {
+        try { onStatus(r); } catch (_) {}
+      }
       await new Promise((res) => setTimeout(res, intervalMs));
     }
     throw new Error("ask polling timed out");
   }
 
-  async function submitAsk({ thread_id = null, q, mode, triggerEl, statusEl, answerEl, badgeEl }) {
+  async function submitAsk({ thread_id = null, q, mode, depth = "standard", triggerEl, statusEl, answerEl, badgeEl }) {
     const path = thread_id ? `/threads/${encodeURIComponent(thread_id)}/ask` : "/ask";
     if (triggerEl) triggerEl.disabled = true;
     statusEl.innerHTML = `<span class="spinner"></span>queuing…`;
     if (badgeEl) badgeEl.textContent = "";
     if (answerEl) answerEl.innerHTML = "";
+    const pollMs = depth === "deep" ? 600000 : 240000;  // deep runs can take minutes
     try {
       let r;
       try {
-        r = await api(path, { method: "POST", body: JSON.stringify({ question: q, mode }) });
-      } catch (e) { toast(e.message, "err"); statusEl.textContent = ""; return null; }
-      statusEl.innerHTML = `<span class="spinner"></span>via ${esc(r.route)} · ingesting…`;
+        r = await api(path, { method: "POST", body: JSON.stringify({ question: q, mode, depth }) });
+      } catch (e) {
+        const msg = e.message || "";
+        if (/deep_daily_cap/i.test(msg)) {
+          statusEl.textContent = "daily deep-run cap reached for this bearer";
+          toast("deep daily cap reached", "warn");
+        } else {
+          toast(msg, "err"); statusEl.textContent = "";
+        }
+        return null;
+      }
+      const initialLabel = r.status === "queued" ? "queued" : "ingesting…";
+      statusEl.innerHTML = `<span class="spinner"></span>via ${esc(r.route)} · ${esc(r.depth || depth)} · ${initialLabel}`;
       try {
-        const result = await pollAskRun(r.run_id);
+        const result = await pollAskRun(r.run_id, {
+          maxMs: pollMs,
+          onStatus(s) {
+            if (s.status === "queued") {
+              const pos = (s.queue_position ?? 0) + 1;
+              const total = s.queue_total ?? 1;
+              statusEl.innerHTML = `<span class="spinner"></span>queued · position ${pos} of ${total} · waiting for slot`;
+            } else if (s.status === "running") {
+              statusEl.innerHTML = `<span class="spinner"></span>via ${esc(s.route)} · ${esc(s.depth || depth)} · synthesizing…`;
+            }
+          },
+        });
         if (result.status === "failed") {
           const msg = (result.errors && result.errors[0] && result.errors[0].message) || "ask failed";
           statusEl.textContent = `failed: ${msg}`;
@@ -102,7 +173,7 @@
         }
         const n = (result.ingested || []).length;
         if (badgeEl) badgeEl.textContent = n > 0 ? `+${n} fetched` : "no new docs";
-        statusEl.textContent = `via ${result.route}`;
+        statusEl.textContent = `via ${result.route} · ${r.depth || depth}`;
         if (answerEl) answerEl.innerHTML = renderAskAnswer(result.synthesis);
         return Object.assign({}, r, { result });
       } catch (e) { toast(e.message, "err"); statusEl.textContent = ""; return null; }
@@ -118,6 +189,12 @@
         <div class="meta">Fetches sources, ingests them, then synthesizes a cited answer.</div>
         <textarea id="ask-q" placeholder="e.g. compare LightRAG and GraphRAG for evaluation robustness"></textarea>
         <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">
+          <span class="meta" style="font-weight:600">Depth:</span>
+          <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-depth" value="standard" checked> standard — default, ~one search round</label>
+          <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-depth" value="deep"> deep — minutes, sectioned report, higher cost</label>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:6px">
+          <span class="meta" style="font-weight:600">Mode:</span>
           <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="auto" checked> auto</label>
           <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="cloud"> cloud</label>
           <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-mode" value="local"> my subscription</label>
@@ -132,8 +209,9 @@
     $("ask-go").addEventListener("click", async () => {
       const q = $("ask-q").value.trim(); if (!q) return;
       const mode = (document.querySelector('input[name="ask-mode"]:checked') || {}).value || "auto";
+      const depth = (document.querySelector('input[name="ask-depth"]:checked') || {}).value || "standard";
       const r = await submitAsk({
-        q, mode,
+        q, mode, depth,
         triggerEl: $("ask-go"),
         statusEl: $("ask-status"),
         answerEl: $("ask-answer"),
@@ -219,25 +297,38 @@
 
   function turnCard(turn) {
     const route = turn.route ? `<span class="meta">via ${esc(turn.route)}</span>` : "";
+    const depthBadge = turn.depth && turn.depth !== "standard"
+      ? `<span class="meta">· ${esc(turn.depth)}</span>` : "";
     const docCount = (turn.ingested_doc_ids || []).length;
     const ingest = docCount ? `<span class="meta">· +${docCount} fetched</span>` : "";
-    const cites = (turn.citations || []).length;
-    const citeBlock = cites
-      ? `<details style="margin-top:8px"><summary class="meta">Citations (${cites})</summary>${
-          (turn.citations || []).map((c, i) => `
-            <div class="card" style="margin-top:6px">
-              <div class="meta">[${c.n ?? (i + 1)}] ${esc(c.query || "")}${c.thread_id ? ` · <a href="#/threads/${encodeURIComponent(c.thread_id)}">thread</a>` : ""}${c.score != null ? ` · ${c.score.toFixed(3)}` : ""}</div>
-              <pre>${esc(c.snippet || "")}</pre>
-            </div>`).join("")
-        }</details>`
-      : "";
+    const isReport = turn.payload_shape === "report";
+    const reportObj = isReport ? _parseReportPayload(turn.answer_md) : null;
+
+    let body = "";
+    if (reportObj) {
+      body = renderReport(reportObj);
+    } else if (turn.answer_md) {
+      body = `<div class="report" style="margin-top:8px">${marked.parse(turn.answer_md)}</div>`;
+    } else {
+      body = `<div class="meta" style="margin-top:8px">(no answer recorded)</div>`;
+    }
+
+    // Flat-shape citations footer (report shape has per-section citation cards).
+    let citeBlock = "";
+    if (!reportObj) {
+      const cites = (turn.citations || []).length;
+      if (cites) {
+        citeBlock = `<details style="margin-top:8px"><summary class="meta">Citations (${cites})</summary>${
+          (turn.citations || []).map(_citationCard).join("")
+        }</details>`;
+      }
+    }
+
     return `
       <div class="card">
-        <div class="meta">${esc(fmtDate(turn.created_at))} ${route} ${ingest}</div>
+        <div class="meta">${esc(fmtDate(turn.created_at))} ${route} ${depthBadge} ${ingest}</div>
         <div style="margin-top:6px"><strong>Q:</strong> ${esc(turn.question || "")}</div>
-        ${turn.answer_md
-          ? `<div class="report" style="margin-top:8px">${marked.parse(turn.answer_md)}</div>`
-          : `<div class="meta" style="margin-top:8px">(no answer recorded)</div>`}
+        ${body}
         ${citeBlock}
       </div>`;
   }
@@ -259,6 +350,12 @@
           <h3 style="margin:0 0 6px">Continue</h3>
           <textarea id="c-q" placeholder="follow-up question — fetches more sources if needed"></textarea>
           <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">
+            <span class="meta" style="font-weight:600">Depth:</span>
+            <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="c-depth" value="standard" checked> standard</label>
+            <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="c-depth" value="deep"> deep</label>
+          </div>
+          <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:6px">
+            <span class="meta" style="font-weight:600">Mode:</span>
             <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="auto" checked> auto</label>
             <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="cloud"> cloud</label>
             <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="c-mode" value="local"> my subscription</label>
@@ -278,8 +375,9 @@
       $("c-go").onclick = async () => {
         const q = $("c-q").value.trim(); if (!q) return;
         const mode = (document.querySelector('input[name="c-mode"]:checked') || {}).value || "auto";
+        const depth = (document.querySelector('input[name="c-depth"]:checked') || {}).value || "standard";
         const r = await submitAsk({
-          thread_id: tid, q, mode,
+          thread_id: tid, q, mode, depth,
           triggerEl: $("c-go"),
           statusEl: $("c-status"),
           answerEl: $("c-answer"),

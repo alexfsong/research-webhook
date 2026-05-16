@@ -38,12 +38,36 @@ API_KEY = os.environ.get("WEBHOOK_API_KEY", "").strip()
 ANTHROPIC_OAT = os.environ.get("ANTHROPIC_OAT", "").strip()
 ROUTINE_RESEARCH_FIRE_URL = os.environ.get("ROUTINE_RESEARCH_FIRE_URL", "").strip()
 ROUTINE_INGEST_ASK_FIRE_URL = os.environ.get("ROUTINE_INGEST_ASK_FIRE_URL", "").strip()
+ROUTINE_ASK_DEEP_FIRE_URL = os.environ.get("ROUTINE_ASK_DEEP_FIRE_URL", "").strip()
 ROUTINE_FIRE_BETA = os.environ.get("ROUTINE_FIRE_BETA", "experimental-cc-routine-2026-04-01").strip()
 RESEARCH_RUN_TTL = int(os.environ.get("RESEARCH_RUN_TTL", "3600"))
 ASK_RUN_TTL = int(os.environ.get("ASK_RUN_TTL", "3600"))
 ASK_DEFAULT_MAX_FETCHES = int(os.environ.get("ASK_DEFAULT_MAX_FETCHES", "10"))
 ASK_HISTORY_MAX_TURNS = int(os.environ.get("ASK_HISTORY_MAX_TURNS", "4"))
 ASK_HISTORY_ANSWER_TRUNC = int(os.environ.get("ASK_HISTORY_ANSWER_TRUNC", "800"))
+
+ASK_DEPTH_ENABLED = os.environ.get("ASK_DEPTH_ENABLED", "true").lower() == "true"
+
+
+def _depth_budget(tier: str) -> dict:
+    """Read per-tier ASK_DEPTH_<TIER>_MAX_* env vars into a budget dict."""
+    T = tier.upper()
+    return {
+        "max_searches": int(os.environ.get(f"ASK_DEPTH_{T}_MAX_SEARCHES", "1" if tier == "standard" else "8")),
+        "max_fetches": int(os.environ.get(f"ASK_DEPTH_{T}_MAX_FETCHES", "5" if tier == "standard" else "25")),
+        "max_tokens": int(os.environ.get(f"ASK_DEPTH_{T}_MAX_TOKENS", "8000" if tier == "standard" else "80000")),
+        "max_iterations": int(os.environ.get(f"ASK_DEPTH_{T}_MAX_ITERATIONS", "1" if tier == "standard" else "8")),
+    }
+
+
+ASK_DEPTH_BUDGETS: dict[str, dict] = {
+    "standard": _depth_budget("standard"),
+    "deep": _depth_budget("deep"),
+}
+ASK_DEPTH_DEEP_MAX_PER_DAY = int(os.environ.get("ASK_DEPTH_DEEP_MAX_PER_DAY", "20"))
+ASK_DEPTH_DEEP_MAX_DRAINERS = int(os.environ.get("ASK_DEPTH_DEEP_MAX_DRAINERS", "3"))
+ASK_DEPTH_DEEP_BACKEND = os.environ.get("ASK_DEPTH_DEEP_BACKEND", "subscription").strip().lower()
+ASK_DEPTH_DEEP_SUBPROCESS_TIMEOUT = int(os.environ.get("ASK_DEPTH_DEEP_SUBPROCESS_TIMEOUT", "600"))
 CLAUDE_FALLBACK_USER = os.environ.get("CLAUDE_FALLBACK_USER", "claude-runner").strip()
 CLAUDE_FALLBACK_TIMEOUT = int(os.environ.get("CLAUDE_FALLBACK_TIMEOUT", "240"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/home/claude-runner/.npm-global/bin/claude").strip()
@@ -56,6 +80,22 @@ app = FastAPI(title="Research Webhook")
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.on_event("startup")
+async def _resume_deep_queue() -> None:
+    """Revive any rows left in 'running' from a previous process, then spawn drainers."""
+    try:
+        revived = await asyncio.to_thread(courses_db.revive_stale_running)
+        if revived:
+            log.info("deep queue: revived %d stale running rows", revived)
+        bearers = await asyncio.to_thread(courses_db.bearers_with_queued)
+        for b in bearers:
+            await _ensure_drainer(b)
+        if bearers:
+            log.info("deep queue: spawned drainers for %d bearer(s)", len(bearers))
+    except Exception:
+        log.exception("deep queue startup failed")
 
 
 _li_store = None
@@ -82,6 +122,16 @@ def check_auth(authorization: str | None = Header(default=None)):
         raise HTTPException(403, "invalid token")
 
 
+def _bearer(authorization: str | None) -> str:
+    """Extract the bearer token (or 'anon' if no API_KEY set). Used as the deep-rate-limit key."""
+    if not authorization:
+        return "anon"
+    parts = authorization.split(None, 1)
+    if len(parts) < 2:
+        return "anon"
+    return parts[1].strip() or "anon"
+
+
 class SynthesizeLIRequest(BaseModel):
     question: str
     k: int = 8
@@ -92,10 +142,23 @@ class SynthesizeLIRequest(BaseModel):
 class AskRequest(BaseModel):
     question: str
     mode: Literal["auto", "cloud", "local"] = "auto"
+    depth: Literal["standard", "deep"] = "standard"
     thread_id: str | None = None
     max_fetches: int | None = None
     urls: list[str] | None = None
     topic: str | None = None
+
+
+class ReportSection(BaseModel):
+    heading: str
+    body: str
+    citations: list[dict] = []
+
+
+class ReportPayload(BaseModel):
+    toc: list[str]
+    sections: list[ReportSection]
+    termination: Literal["empty_gaps", "iteration_cap", "token_cap"] | None = None
 
 
 class AskCallback(BaseModel):
@@ -107,6 +170,7 @@ class AskCallback(BaseModel):
     errors: list[dict] = []
     answer_md: str = ""
     citations: list[dict] = []
+    report: ReportPayload | None = None
 
 
 class IngestRequest(BaseModel):
@@ -293,11 +357,11 @@ async def delete_thread(thread_id: str):
 
 
 @app.post("/threads/{thread_id}/ask", dependencies=[Depends(check_auth)])
-async def thread_ask(thread_id: str, req: AskRequest):
+async def thread_ask(thread_id: str, req: AskRequest, authorization: str | None = Header(default=None)):
     if not courses_db.get_ask_thread(thread_id):
         raise HTTPException(404, "thread not found")
     req.thread_id = thread_id
-    return await _ask_kickoff(req)
+    return await _ask_kickoff(req, bearer=_bearer(authorization))
 
 
 @app.get("/search2", dependencies=[Depends(check_auth)])
@@ -378,6 +442,55 @@ _ask_runs: dict[str, dict] = {}
 _ask_runs_lock = asyncio.Lock()
 _pool_full_at: float = 0.0  # epoch seconds; cooldown window for cloud route
 
+# Deep-tier queue accounting. The queue itself lives in SQLite (ask_deep_queue);
+# this layer only tracks which bearers have an active drainer task in-process.
+_deep_drainers: dict[str, asyncio.Task] = {}  # bearer -> drainer task
+_deep_drainer_lock = asyncio.Lock()
+_deep_global_sem: asyncio.Semaphore | None = None  # initialized on startup
+
+
+def _deep_sem() -> asyncio.Semaphore:
+    global _deep_global_sem
+    if _deep_global_sem is None:
+        _deep_global_sem = asyncio.Semaphore(max(1, ASK_DEPTH_DEEP_MAX_DRAINERS))
+    return _deep_global_sem
+
+
+async def _ensure_drainer(bearer: str) -> None:
+    """Spawn the drainer for this bearer if one isn't already running."""
+    async with _deep_drainer_lock:
+        existing = _deep_drainers.get(bearer)
+        if existing and not existing.done():
+            return
+        _deep_drainers[bearer] = asyncio.create_task(_drain_deep(bearer))
+
+
+async def _drain_deep(bearer: str) -> None:
+    """Serially pop + run deep rows for one bearer. Exits when queue is empty."""
+    import deep_research  # lazy
+    while True:
+        row = await asyncio.to_thread(courses_db.pop_next_for_bearer, bearer)
+        if not row:
+            async with _deep_drainer_lock:
+                _deep_drainers.pop(bearer, None)
+            return
+        run_id = row["run_id"]
+        payload = row["payload"]
+        async with _ask_runs_lock:
+            run = _ask_runs.get(run_id)
+            if run is not None:
+                run["status"] = "running"
+                run["started_at"] = time.time()
+        async with _deep_sem():
+            try:
+                await deep_research.run_deep(run_id=run_id, payload=payload, bearer=bearer)
+            except Exception as e:
+                log.exception("deep run crashed run=%s", run_id)
+                await _ask_fail(run_id, f"deep crash: {e}")
+                await asyncio.to_thread(courses_db.mark_deep_done, run_id, error=str(e)[:300])
+            else:
+                await asyncio.to_thread(courses_db.mark_deep_done, run_id)
+
 
 async def _evict_old_ask_runs() -> None:
     cutoff = time.time() - ASK_RUN_TTL
@@ -392,20 +505,22 @@ def _pool_full_recently() -> bool:
     return (time.time() - _pool_full_at) < POOL_FULL_COOLDOWN_S
 
 
-async def _pick_ask_route(mode: str) -> str:
+async def _pick_ask_route(mode: str, depth: str = "standard") -> str:
     if mode == "cloud":
         return "cloud"
     if mode == "local":
         return "local"
-    if not ANTHROPIC_OAT or not ROUTINE_INGEST_ASK_FIRE_URL:
+    fire_url = ROUTINE_ASK_DEEP_FIRE_URL if depth == "deep" else ROUTINE_INGEST_ASK_FIRE_URL
+    if not ANTHROPIC_OAT or not fire_url:
         return "local"  # cloud not configured; auto → local
     if _pool_full_recently():
         return "local"
     return "cloud"
 
 
-async def _fire_ask_routine(payload: dict, run_id: str) -> None:
+async def _fire_ask_routine(payload: dict, run_id: str, depth: str = "standard") -> None:
     global _pool_full_at
+    fire_url = ROUTINE_ASK_DEEP_FIRE_URL if depth == "deep" else ROUTINE_INGEST_ASK_FIRE_URL
     headers = {
         "Authorization": f"Bearer {ANTHROPIC_OAT}",
         "anthropic-beta": ROUTINE_FIRE_BETA,
@@ -415,7 +530,7 @@ async def _fire_ask_routine(payload: dict, run_id: str) -> None:
     body = {"text": json.dumps(payload)}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(ROUTINE_INGEST_ASK_FIRE_URL, headers=headers, json=body)
+            r = await client.post(fire_url, headers=headers, json=body)
     except httpx.HTTPError as e:
         await _ask_fail(run_id, f"routine fire transport: {e}")
         return
@@ -502,7 +617,7 @@ async def _ask_fail(run_id: str, message: str) -> None:
     log.warning("ask run %s failed: %s", run_id, message)
 
 
-async def _ask_kickoff(req: AskRequest) -> dict:
+async def _ask_kickoff(req: AskRequest, bearer: str = "anon") -> dict:
     """Shared entry point for POST /ask and POST /threads/{id}/ask."""
     if not LLAMAINDEX_ENABLED:
         raise HTTPException(503, "llamaindex disabled")
@@ -510,6 +625,10 @@ async def _ask_kickoff(req: AskRequest) -> dict:
     urls = list(req.urls or [])
     if not q and not urls:
         raise HTTPException(400, "question or urls required")
+
+    depth = req.depth if ASK_DEPTH_ENABLED else "standard"
+    if depth not in ASK_DEPTH_BUDGETS:
+        raise HTTPException(422, f"unknown depth: {depth}")
 
     is_continuation = bool(req.thread_id)
     thread_id = req.thread_id or courses_db.create_ask_thread(
@@ -530,25 +649,37 @@ async def _ask_kickoff(req: AskRequest) -> dict:
                 history = history[-ASK_HISTORY_MAX_TURNS:]
 
     run_id = "ask_" + secrets.token_hex(8)
-    max_fetches = max(1, min(int(req.max_fetches or ASK_DEFAULT_MAX_FETCHES), 25))
+    budget = ASK_DEPTH_BUDGETS[depth]
+    max_fetches = max(1, min(int(req.max_fetches or budget["max_fetches"]), 25))
     payload = {
         "run_id": run_id,
         "question": q,
         "thread_id": thread_id,
+        "depth": depth,
+        "budget": budget,
         "max_fetches": max_fetches,
         "topic": (req.topic or "").strip(),
         "urls": urls,
         "history": history,
     }
 
-    route = await _pick_ask_route(req.mode)
-    turn_id = courses_db.add_ask_turn(thread_id, q or "(urls)", route, run_id)
+    if depth == "deep":
+        # Daily cap enforced at enqueue time against the persisted queue.
+        today_n = await asyncio.to_thread(courses_db.count_deep_today, bearer)
+        if today_n >= ASK_DEPTH_DEEP_MAX_PER_DAY:
+            raise HTTPException(429, "deep_daily_cap")
 
+    route = await _pick_ask_route(req.mode, depth)
+    turn_id = courses_db.add_ask_turn(thread_id, q or "(urls)", route, run_id, depth=depth)
+
+    initial_status = "queued" if depth == "deep" else "pending"
     async with _ask_runs_lock:
         _ask_runs[run_id] = {
             "run_id": run_id,
-            "status": "pending",
+            "status": initial_status,
             "route": route,
+            "depth": depth,
+            "bearer": bearer,
             "thread_id": thread_id,
             "turn_id": turn_id,
             "question": q,
@@ -560,31 +691,71 @@ async def _ask_kickoff(req: AskRequest) -> dict:
         }
 
     _audit_log({
-        "ts": _now_iso(), "run_id": run_id, "route": route,
+        "ts": _now_iso(), "run_id": run_id, "route": route, "depth": depth,
         "thread_id": thread_id, "turn_id": turn_id,
         "q_prefix": q[:80],
     })
 
-    if route == "cloud":
-        asyncio.create_task(_fire_ask_routine(payload, run_id))
+    if depth == "deep":
+        # Persist on the queue + spawn (or reuse) the per-bearer drainer.
+        await asyncio.to_thread(
+            courses_db.enqueue_deep, run_id, bearer, payload,
+            thread_id=thread_id, turn_id=turn_id, depth=depth,
+        )
+        await _ensure_drainer(bearer)
+    elif route == "cloud":
+        asyncio.create_task(_fire_ask_routine(payload, run_id, depth))
     else:
         asyncio.create_task(_fire_ask_local_skill(payload, run_id))
 
-    return {"run_id": run_id, "thread_id": thread_id, "turn_id": turn_id, "route": route}
+    return {"run_id": run_id, "thread_id": thread_id, "turn_id": turn_id, "route": route, "depth": depth, "status": initial_status}
 
 
 @app.post("/ask", dependencies=[Depends(check_auth)])
-async def ask(req: AskRequest):
-    return await _ask_kickoff(req)
+async def ask(req: AskRequest, authorization: str | None = Header(default=None)):
+    return await _ask_kickoff(req, bearer=_bearer(authorization))
+
+
+def _validate_report(report: ReportPayload) -> None:
+    if len(report.toc) != len(report.sections):
+        raise HTTPException(400, "report.toc length must match sections length")
+    for i, sec in enumerate(report.sections):
+        body = sec.body or ""
+        cite_idxs = {int(m.group(1)) for m in re.finditer(r"\[(\d+)\]", body)}
+        cite_count = len(sec.citations or [])
+        for idx in cite_idxs:
+            if idx < 1 or idx > cite_count:
+                raise HTTPException(400, f"section {i} cites [{idx}] but only {cite_count} citations supplied")
+
+
+def _report_to_answer_md(report: ReportPayload) -> str:
+    """Flatten report for legacy renderers + thread history. PWA reads payload_shape='report' from answer_md JSON."""
+    return json.dumps({
+        "shape": "report",
+        "toc": report.toc,
+        "sections": [s.dict() for s in report.sections],
+        "termination": report.termination,
+    })
 
 
 @app.post("/ask_callback", dependencies=[Depends(check_auth)])
 async def ask_callback(cb: AskCallback):
-    syn = (
-        {"answer": cb.answer_md, "citations": cb.citations or []}
-        if cb.answer_md
-        else None
-    )
+    if cb.report is not None:
+        _validate_report(cb.report)
+        answer_md = _report_to_answer_md(cb.report)
+        # Aggregate citations across sections (preserve duplicates so per-section indices stay stable).
+        flat_citations: list[dict] = []
+        for sec in cb.report.sections:
+            flat_citations.extend(sec.citations or [])
+        citations = flat_citations
+        payload_shape = "report"
+        syn = {"answer": answer_md, "citations": citations, "report": cb.report.dict()}
+    else:
+        answer_md = cb.answer_md or ""
+        citations = cb.citations or []
+        payload_shape = "flat"
+        syn = {"answer": answer_md, "citations": citations} if answer_md else None
+
     async with _ask_runs_lock:
         run = _ask_runs.get(cb.run_id)
         if run is None:
@@ -597,6 +768,7 @@ async def ask_callback(cb: AskCallback):
         run["synthesis"] = syn
         run["status"] = "complete" if cb.status == "complete" else "failed"
         run["finished_at"] = time.time()
+        run["payload_shape"] = payload_shape
         turn_id = run.get("turn_id")
 
     if turn_id:
@@ -604,8 +776,9 @@ async def ask_callback(cb: AskCallback):
             courses_db.update_ask_turn(
                 turn_id,
                 ingested_doc_ids=[i.get("doc_id") for i in (cb.ingested or []) if i.get("doc_id")],
-                answer_md=cb.answer_md or "",
-                citations=cb.citations or [],
+                answer_md=answer_md,
+                citations=citations,
+                payload_shape=payload_shape,
             )
         except Exception:
             log.exception("ask_turn persist failed run=%s turn=%s", cb.run_id, turn_id)
@@ -642,10 +815,11 @@ async def ask_run_status(run_id: str):
                 "citations": json.loads(row["citations_json"] or "[]"),
             } if row["answer_md"] else None),
         }
-    return {
+    resp = {
         "run_id": run_id,
         "status": run["status"],
         "route": run["route"],
+        "depth": run.get("depth", "standard"),
         "thread_id": run["thread_id"],
         "turn_id": run["turn_id"],
         "ingested": run.get("ingested", []),
@@ -656,6 +830,17 @@ async def ask_run_status(run_id: str):
         "finished_at": run.get("finished_at"),
         "claude_code_session_url": run.get("claude_session_url"),
     }
+    if run.get("depth") == "deep" and run["status"] in ("queued", "running", "pending"):
+        try:
+            qp = await asyncio.to_thread(courses_db.queue_position, run_id)
+            if qp:
+                resp["queue_position"] = qp.get("queue_position", 0)
+                resp["queue_total"] = qp.get("queue_total", 0)
+                if qp.get("status") == "running" and resp["status"] == "queued":
+                    resp["status"] = "running"
+        except Exception:
+            log.exception("queue_position lookup failed run=%s", run_id)
+    return resp
 
 
 @app.post("/courses", dependencies=[Depends(check_auth)])

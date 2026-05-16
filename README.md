@@ -53,6 +53,40 @@ GET    /research/{run_id}                               poll run status
 
 All routes (except `/health`) require `Authorization: Bearer <WEBHOOK_API_KEY>`.
 
+## Ask depth tiers
+
+`POST /ask` accepts `depth` ∈ `{"standard","deep"}` (default `standard`).
+
+- **standard** — today's single-pass behavior: one web search → ~5 fetches → cited
+  Markdown answer. Default. Cost ≈ one Sonnet call + small fetch budget per turn.
+- **deep** — multi-round iterative loop. Each round: corpus retrieve → one
+  Anthropic tool-use call that emits section drafts + next-round gap queries →
+  dedupe → repeat until gaps empty / iteration cap / token cap. Output is a
+  sectioned long-form report with TOC + per-section citations, not a single
+  answer block. **Cost: materially higher** — typically minutes per turn and
+  several × the Sonnet + web token spend of a standard run. Gate behind an
+  explicit user choice in the UI.
+
+**Queue + subscription auth.** Submitting `depth=deep` enqueues the run on a
+persisted SQLite FIFO (`ask_deep_queue`) per bearer; a serial drainer pops the
+oldest queued row and runs it. The PWA shows `queued · position N of M` until
+the slot opens. The synthesizer for each round runs under `claude -p
+"/deep-synth …"` by default, so deep-research cost charges against the
+operator's Claude Pro/Max plan — set `ASK_DEPTH_DEEP_BACKEND=api` to force the
+Anthropic SDK path with `ANTHROPIC_API_KEY` instead.
+
+Caps (set in `.env`, see `ASK_DEPTH_*` block):
+
+- Per-tier `MAX_{SEARCHES,FETCHES,TOKENS,ITERATIONS}`.
+- `ASK_DEPTH_DEEP_MAX_PER_DAY` per bearer, enforced at enqueue time
+  (over → HTTP 429 `deep_daily_cap`).
+- One in-flight deep per bearer; additional submissions enqueue rather than 429.
+- `ASK_DEPTH_DEEP_MAX_DRAINERS` caps concurrent deep subprocesses across all
+  bearers.
+
+Rollback: set `ASK_DEPTH_ENABLED=false` to force every `/ask` back to standard
+regardless of the requested tier.
+
 ## Architecture (one-screen)
 
 ```

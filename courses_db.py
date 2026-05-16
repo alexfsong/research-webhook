@@ -136,8 +136,26 @@ SCHEMA = [
       ingested_doc_ids_json TEXT NOT NULL DEFAULT '[]',
       answer_md TEXT,
       citations_json TEXT NOT NULL DEFAULT '[]',
+      depth TEXT NOT NULL DEFAULT 'standard',
+      payload_shape TEXT NOT NULL DEFAULT 'flat',
       created_at TEXT NOT NULL,
       UNIQUE(thread_id, idx)
+    )
+    """,
+    # --- ask_deep_queue (deep-research subscription-quota queue) ---
+    """
+    CREATE TABLE IF NOT EXISTS ask_deep_queue (
+      run_id TEXT PRIMARY KEY,
+      bearer TEXT NOT NULL,
+      thread_id TEXT,
+      turn_id TEXT,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      depth TEXT NOT NULL DEFAULT 'deep',
+      enqueued_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT,
+      error TEXT
     )
     """,
     # --- indexes ---
@@ -152,6 +170,8 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_ask_threads_updated ON ask_threads(updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_ask_turns_thread ON ask_turns(thread_id, idx)",
     "CREATE INDEX IF NOT EXISTS idx_ask_turns_run ON ask_turns(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_deep_queue_bearer ON ask_deep_queue(bearer, status, enqueued_at)",
+    "CREATE INDEX IF NOT EXISTS idx_deep_queue_status ON ask_deep_queue(status, enqueued_at)",
 ]
 
 
@@ -178,6 +198,8 @@ _MIGRATIONS = [
     # (table, column, ddl) — idempotent; skipped if column already exists.
     ("lessons", "source", "ALTER TABLE lessons ADD COLUMN source TEXT NOT NULL DEFAULT 'generated'"),
     ("lessons", "edited_at", "ALTER TABLE lessons ADD COLUMN edited_at TEXT"),
+    ("ask_turns", "depth", "ALTER TABLE ask_turns ADD COLUMN depth TEXT NOT NULL DEFAULT 'standard'"),
+    ("ask_turns", "payload_shape", "ALTER TABLE ask_turns ADD COLUMN payload_shape TEXT NOT NULL DEFAULT 'flat'"),
 ]
 
 
@@ -469,7 +491,13 @@ def create_ask_thread(title: str) -> str:
     return tid
 
 
-def add_ask_turn(thread_id: str, question: str, route: str, run_id: str) -> str:
+def add_ask_turn(
+    thread_id: str,
+    question: str,
+    route: str,
+    run_id: str,
+    depth: str = "standard",
+) -> str:
     """Append a new turn. Returns turn_id; bumps thread updated_at."""
     tnid = _new_id("turn")
     now = _now()
@@ -480,9 +508,9 @@ def add_ask_turn(thread_id: str, question: str, route: str, run_id: str) -> str:
         ).fetchone()
         next_idx = (row["m"] if row and row["m"] is not None else -1) + 1
         conn.execute(
-            "INSERT INTO ask_turns(id,thread_id,idx,question,route,run_id,created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (tnid, thread_id, next_idx, question, route, run_id, now),
+            "INSERT INTO ask_turns(id,thread_id,idx,question,route,run_id,depth,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (tnid, thread_id, next_idx, question, route, run_id, depth, now),
         )
         conn.execute(
             "UPDATE ask_threads SET updated_at=? WHERE id=?", (now, thread_id),
@@ -496,6 +524,7 @@ def update_ask_turn(
     ingested_doc_ids: list | None = None,
     answer_md: str | None = None,
     citations: list | None = None,
+    payload_shape: str | None = None,
 ) -> None:
     fields: dict = {}
     if ingested_doc_ids is not None:
@@ -504,6 +533,8 @@ def update_ask_turn(
         fields["answer_md"] = answer_md
     if citations is not None:
         fields["citations_json"] = json.dumps(citations)
+    if payload_shape is not None:
+        fields["payload_shape"] = payload_shape
     if not fields:
         return
     cols = ", ".join(f"{k}=?" for k in fields)
@@ -572,6 +603,136 @@ def delete_ask_thread(thread_id: str) -> bool:
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM ask_threads WHERE id=?", (thread_id,))
         return cur.rowcount > 0
+
+
+# ------------------------------------------------------------------------- #
+# ask_deep_queue DAO — subscription-quota queue for deep-research runs.
+# ------------------------------------------------------------------------- #
+
+def enqueue_deep(
+    run_id: str,
+    bearer: str,
+    payload: dict,
+    *,
+    thread_id: str | None = None,
+    turn_id: str | None = None,
+    depth: str = "deep",
+) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO ask_deep_queue(run_id,bearer,thread_id,turn_id,payload_json,status,depth,enqueued_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (run_id, bearer, thread_id, turn_id, json.dumps(payload), "queued", depth, _now()),
+        )
+
+
+def pop_next_for_bearer(bearer: str) -> dict | None:
+    """Atomically claim the oldest queued row for this bearer (status queued → running).
+
+    Returns the row dict with payload decoded, or None if nothing pending.
+    """
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM ask_deep_queue "
+            "WHERE bearer=? AND status='queued' "
+            "ORDER BY enqueued_at ASC LIMIT 1",
+            (bearer,),
+        ).fetchone()
+        if not row:
+            conn.execute("COMMIT")
+            return None
+        conn.execute(
+            "UPDATE ask_deep_queue SET status='running', started_at=? WHERE run_id=?",
+            (_now(), row["run_id"]),
+        )
+        conn.execute("COMMIT")
+    d = dict(row)
+    d["payload"] = json.loads(d.pop("payload_json") or "{}")
+    d["status"] = "running"
+    return d
+
+
+def mark_deep_done(run_id: str, *, error: str | None = None) -> None:
+    status = "failed" if error else "done"
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE ask_deep_queue SET status=?, finished_at=?, error=? WHERE run_id=?",
+            (status, _now(), error, run_id),
+        )
+
+
+def count_deep_today(bearer: str) -> int:
+    today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT COUNT(*) AS n FROM ask_deep_queue "
+            "WHERE bearer=? AND enqueued_at LIKE ?",
+            (bearer, f"{today_prefix}%"),
+        ).fetchone()
+    return int(r["n"]) if r else 0
+
+
+def queue_position(run_id: str) -> dict:
+    """Return {status, queue_position, queue_total, started_at, finished_at, error} for a queued/running deep run.
+
+    queue_position counts queued rows for the same bearer with strictly earlier enqueued_at.
+    queue_total counts ALL queued rows for the bearer (incl. this one).
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM ask_deep_queue WHERE run_id=?", (run_id,),
+        ).fetchone()
+        if not row:
+            return {}
+        ahead = conn.execute(
+            "SELECT COUNT(*) AS n FROM ask_deep_queue "
+            "WHERE bearer=? AND status='queued' AND enqueued_at < ?",
+            (row["bearer"], row["enqueued_at"]),
+        ).fetchone()
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM ask_deep_queue "
+            "WHERE bearer=? AND status='queued'",
+            (row["bearer"],),
+        ).fetchone()
+    return {
+        "status": row["status"],
+        "queue_position": int(ahead["n"]),
+        "queue_total": int(total["n"]),
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "error": row["error"],
+    }
+
+
+def bearers_with_queued() -> list[str]:
+    """Bearers that currently have at least one queued (or running) deep row.
+
+    Used at FastAPI startup to spawn one drainer per bearer with pending work.
+    Includes 'running' rows so a webhook restart mid-flight resumes the drainer
+    even if the previous process didn't finish the row (it will be retried by
+    pop_next_for_bearer once we mark stale 'running' rows back to 'queued').
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT bearer FROM ask_deep_queue "
+            "WHERE status IN ('queued','running')"
+        ).fetchall()
+    return [r["bearer"] for r in rows]
+
+
+def revive_stale_running() -> int:
+    """Flip any 'running' rows back to 'queued' so a restart picks them up.
+
+    Webhook restart leaves any in-flight row stuck in 'running' until reaped. Run
+    this once at startup before spawning drainers.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE ask_deep_queue SET status='queued', started_at=NULL "
+            "WHERE status='running'"
+        )
+        return cur.rowcount
 
 
 if __name__ == "__main__":
