@@ -20,9 +20,18 @@ Routines that feed `/ingest` and trigger `/research_fire`.
 | `deploy/research-webhook.service` | systemd unit (template) |
 | `deploy/Caddyfile.snippet` | Caddy reverse-proxy block |
 | `.env.example` | Env var reference |
+| `tests/` | Unit + opt-in eval suite — see [TESTING.md](TESTING.md) |
+| `requirements-dev.txt` | Test-only deps (`pytest`, plugins) |
 
 `run_research.sh` is a manual helper to invoke the LangGraph deep-research
 agent from the shell — not used by the webhook directly.
+
+**Tests required for prompt changes.** Any change to the course-generation
+prompts in `courses.py` (or to the models it points at via `COURSE_*_MODEL`
+env vars) should be validated with the eval suite before deploy. The unit
+suite covers parser/DAO/contract regressions and runs on every push; the
+eval suite is opt-in (`pytest -m eval` with `ANTHROPIC_API_KEY` set). See
+[TESTING.md](TESTING.md) for cost expectations and tuning knobs.
 
 ## Endpoint surface
 
