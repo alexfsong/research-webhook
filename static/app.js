@@ -1,5 +1,7 @@
 (() => {
   const TOKEN_KEY = "research_token";
+  const BRANCH_PREFILL_KEY = "branch_prefill";  // sessionStorage handoff to viewAsk
+  const COLLAPSE_KEY = "threads_collapsed";    // sessionStorage tree-collapse state
   const $ = (id) => document.getElementById(id);
   const gate = $("gate"), appEl = $("app"), view = $("view");
   let token = localStorage.getItem(TOKEN_KEY) || "";
@@ -130,17 +132,30 @@
     throw new Error("ask polling timed out");
   }
 
-  async function submitAsk({ thread_id = null, q, mode, depth = "standard", triggerEl, statusEl, answerEl, badgeEl }) {
-    const path = thread_id ? `/threads/${encodeURIComponent(thread_id)}/ask` : "/ask";
+  async function submitAsk({ thread_id = null, q, mode, depth = "standard",
+                             parent_thread_id = null, parent_turn_id = null, parent_quote = null,
+                             triggerEl, statusEl, answerEl, badgeEl }) {
+    // Branched requests always POST /ask (the webhook forces a new thread); regular
+    // continuations POST /threads/{id}/ask. Never both at once — the validator rejects.
+    const isBranch = !!(parent_thread_id && parent_turn_id);
+    const path = (isBranch || !thread_id)
+      ? "/ask"
+      : `/threads/${encodeURIComponent(thread_id)}/ask`;
     if (triggerEl) triggerEl.disabled = true;
     statusEl.innerHTML = `<span class="spinner"></span>queuing…`;
     if (badgeEl) badgeEl.textContent = "";
     if (answerEl) answerEl.innerHTML = "";
-    const pollMs = depth === "deep" ? 600000 : 240000;  // deep runs can take minutes
+    const pollMs = depth === "deep" ? 600000 : 240000;
     try {
       let r;
       try {
-        r = await api(path, { method: "POST", body: JSON.stringify({ question: q, mode, depth }) });
+        const body = { question: q, mode, depth };
+        if (isBranch) {
+          body.parent_thread_id = parent_thread_id;
+          body.parent_turn_id = parent_turn_id;
+          if (parent_quote) body.parent_quote = parent_quote;
+        }
+        r = await api(path, { method: "POST", body: JSON.stringify(body) });
       } catch (e) {
         const msg = e.message || "";
         if (/deep_daily_cap/i.test(msg)) {
@@ -183,11 +198,29 @@
   }
 
   async function viewAsk() {
+    // Branch handoff: a Branch / "Ask about this" tap stashed parent context here.
+    let prefill = null;
+    try {
+      const raw = sessionStorage.getItem(BRANCH_PREFILL_KEY);
+      if (raw) {
+        prefill = JSON.parse(raw);
+        sessionStorage.removeItem(BRANCH_PREFILL_KEY);  // one-shot
+      }
+    } catch (_) { prefill = null; }
+    const initialQ = prefill && prefill.seed ? prefill.seed : "";
+    const branchBanner = prefill ? `
+      <div class="parent-breadcrumb" style="margin-bottom:8px">
+        Branching from <a href="#/threads/${encodeURIComponent(prefill.parent_thread_id)}">parent thread</a>
+        ${prefill.parent_quote ? "· selection-level" : "· turn-level"}
+      </div>
+      ${prefill.parent_quote ? `<div class="parent-quote">${esc(prefill.parent_quote)}</div>` : ""}` : "";
+
     view.innerHTML = `
       <div class="card">
-        <h3>Ask</h3>
+        <h3>Ask${prefill ? " — new branch" : ""}</h3>
+        ${branchBanner}
         <div class="meta">Fetches sources, ingests them, then synthesizes a cited answer.</div>
-        <textarea id="ask-q" placeholder="e.g. compare LightRAG and GraphRAG for evaluation robustness"></textarea>
+        <textarea id="ask-q" placeholder="e.g. compare LightRAG and GraphRAG for evaluation robustness">${esc(initialQ)}</textarea>
         <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">
           <span class="meta" style="font-weight:600">Depth:</span>
           <label class="meta" style="display:inline-flex;align-items:center;gap:4px"><input type="radio" name="ask-depth" value="standard" checked> standard — default, ~one search round</label>
@@ -210,15 +243,20 @@
       const q = $("ask-q").value.trim(); if (!q) return;
       const mode = (document.querySelector('input[name="ask-mode"]:checked') || {}).value || "auto";
       const depth = (document.querySelector('input[name="ask-depth"]:checked') || {}).value || "standard";
+      const branchParams = prefill ? {
+        parent_thread_id: prefill.parent_thread_id,
+        parent_turn_id: prefill.parent_turn_id,
+        parent_quote: prefill.parent_quote || null,
+      } : {};
       const r = await submitAsk({
-        q, mode, depth,
+        q, mode, depth, ...branchParams,
         triggerEl: $("ask-go"),
         statusEl: $("ask-status"),
         answerEl: $("ask-answer"),
         badgeEl: $("ask-badge"),
       });
       if (r && r.thread_id) {
-        // Land the user inside the conversation so they can keep going.
+        // Land the user inside the (possibly newly-branched) conversation.
         location.hash = `#/threads/${encodeURIComponent(r.thread_id)}`;
       }
     });
@@ -282,16 +320,79 @@
     $("s-q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   }
 
+  function _getCollapsed() {
+    try { return new Set(JSON.parse(sessionStorage.getItem(COLLAPSE_KEY) || "[]")); }
+    catch { return new Set(); }
+  }
+  function _setCollapsed(s) {
+    sessionStorage.setItem(COLLAPSE_KEY, JSON.stringify([...s]));
+  }
+
+  function _buildThreadTree(list) {
+    // Group children by parent_thread_id; identify roots (parent_thread_id null
+    // OR parent thread not present in `list`, which can happen near the 50-item
+    // limit — treat orphans as roots so they remain visible).
+    const byId = {};
+    list.forEach((t) => { byId[t.id] = t; });
+    const childrenOf = {};
+    const roots = [];
+    list.forEach((t) => {
+      const pid = t.parent_thread_id;
+      if (pid && byId[pid]) {
+        (childrenOf[pid] = childrenOf[pid] || []).push(t);
+      } else {
+        roots.push(t);
+      }
+    });
+    return { roots, childrenOf };
+  }
+
+  function _renderThreadNode(t, depth, childrenOf, collapsed) {
+    const kids = childrenOf[t.id] || [];
+    const hasKids = kids.length > 0;
+    const isCollapsed = collapsed.has(t.id);
+    const toggle = hasKids
+      ? `<button class="tree-toggle" data-toggle="${esc(t.id)}" title="${isCollapsed ? "expand" : "collapse"}">${isCollapsed ? "▶" : "▼"}</button>`
+      : `<span class="tree-toggle placeholder">·</span>`;
+    const indent = depth > 0 ? `style="padding-left:${depth * 18}px"` : "";
+    const quoteTag = t.has_quote ? '<span class="has-quote-tag">selection</span>' : "";
+    const node = `
+      <div class="tree-row" ${indent}>
+        ${toggle}
+        <a class="card" style="flex:1;display:block;margin-bottom:8px" href="#/threads/${encodeURIComponent(t.id)}">
+          <h3>${esc(t.title || "(untitled)")} ${quoteTag}</h3>
+          <div class="meta">${esc(fmtDate(t.updated_at))} · ${t.turn_count} turn${t.turn_count === 1 ? "" : "s"}${hasKids ? ` · ${kids.length} branch${kids.length === 1 ? "" : "es"}` : ""}</div>
+        </a>
+      </div>`;
+    const kidHtml = (hasKids && !isCollapsed)
+      ? kids.map((k) => _renderThreadNode(k, depth + 1, childrenOf, collapsed)).join("")
+      : "";
+    return node + kidHtml;
+  }
+
   async function viewThreads() {
     setLoading();
     try {
       const list = await api("/threads?limit=50");
       if (!list.length) { view.innerHTML = `<p class="meta">No conversations yet. Start one from the <a href="#/ask">Ask</a> tab.</p>`; return; }
-      view.innerHTML = list.map((t) => `
-        <a class="card" style="display:block" href="#/threads/${encodeURIComponent(t.id)}">
-          <h3>${esc(t.title || "(untitled)")}</h3>
-          <div class="meta">${esc(fmtDate(t.updated_at))} · ${t.turn_count} turn${t.turn_count === 1 ? "" : "s"}</div>
-        </a>`).join("");
+
+      const { roots, childrenOf } = _buildThreadTree(list);
+      const collapsed = _getCollapsed();
+      view.innerHTML = roots.map((r) => _renderThreadNode(r, 0, childrenOf, collapsed)).join("");
+
+      // Wire collapse/expand toggles. Each click flips the entry in sessionStorage
+      // and re-renders just the threads tree.
+      view.querySelectorAll("[data-toggle]").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const id = btn.dataset.toggle;
+          const s = _getCollapsed();
+          if (s.has(id)) s.delete(id); else s.add(id);
+          _setCollapsed(s);
+          viewThreads();  // re-render with new collapse state
+        });
+      });
     } catch (e) { toast(e.message, "err"); view.innerHTML = ""; }
   }
 
@@ -304,16 +405,17 @@
     const isReport = turn.payload_shape === "report";
     const reportObj = isReport ? _parseReportPayload(turn.answer_md) : null;
 
+    // Answer body wrapped in [data-answer-body] so the selection listener can
+    // scope itself to *just* the answer text (not question, not metadata).
     let body = "";
     if (reportObj) {
-      body = renderReport(reportObj);
+      body = `<div data-answer-body>${renderReport(reportObj)}</div>`;
     } else if (turn.answer_md) {
-      body = `<div class="report" style="margin-top:8px">${marked.parse(turn.answer_md)}</div>`;
+      body = `<div data-answer-body class="report" style="margin-top:8px">${marked.parse(turn.answer_md)}</div>`;
     } else {
       body = `<div class="meta" style="margin-top:8px">(no answer recorded)</div>`;
     }
 
-    // Flat-shape citations footer (report shape has per-section citation cards).
     let citeBlock = "";
     if (!reportObj) {
       const cites = (turn.citations || []).length;
@@ -324,28 +426,62 @@
       }
     }
 
+    // Branching is enabled when the user can identify a turn to fork from.
+    // Disabled (button hidden) when window.THREAD_BRANCHING_ENABLED===false
+    // (e.g. set by a future runtime config endpoint).
+    const branchBtn = window.THREAD_BRANCHING_ENABLED === false
+      ? ""
+      : `<button class="branch-btn" data-act="branch" data-turn-id="${esc(turn.id || "")}" title="Fork a new thread from this turn">Branch</button>`;
+
+    const anchorId = turn.id ? `id="turn-${esc(turn.id)}"` : "";
     return `
-      <div class="card">
-        <div class="meta">${esc(fmtDate(turn.created_at))} ${route} ${depthBadge} ${ingest}</div>
+      <div class="card" data-turn="${esc(turn.id || "")}" ${anchorId}>
+        <div class="row" style="justify-content:space-between;align-items:flex-start;gap:8px">
+          <div class="meta" style="flex:1">${esc(fmtDate(turn.created_at))} ${route} ${depthBadge} ${ingest}</div>
+          ${branchBtn}
+        </div>
         <div style="margin-top:6px"><strong>Q:</strong> ${esc(turn.question || "")}</div>
         ${body}
         ${citeBlock}
       </div>`;
   }
 
-  async function viewThreadDetail(tid) {
+  function _stashBranchAndGo({ parent_thread_id, parent_turn_id, parent_quote, seed }) {
+    sessionStorage.setItem(BRANCH_PREFILL_KEY, JSON.stringify({
+      parent_thread_id, parent_turn_id,
+      parent_quote: parent_quote || null,
+      seed: seed || "",
+    }));
+    location.hash = "#/ask";
+  }
+
+  async function viewThreadDetail(tid, focusTurnId = null) {
     setLoading();
     try {
       const t = await api("/threads/" + encodeURIComponent(tid));
       const turnsHtml = (t.turns || []).map(turnCard).join("");
+      const parents = t.parents || [];
+      const parent = parents[0] || null;  // v1 enforces ≤ 1
+      // Breadcrumb passes the target turn id via query string; the route handler
+      // for /threads/:id scrolls the matching turn into view after render.
+      const parentBlock = parent ? `
+        <div style="margin:6px 0 10px">
+          <a class="parent-breadcrumb" href="#/threads/${encodeURIComponent(parent.thread_id)}?focus=${encodeURIComponent(parent.turn_id)}">
+            &larr; branched from parent thread
+          </a>
+          ${parent.quote ? `<div class="parent-quote" id="parent-quote">${esc(parent.quote)}</div>` : ""}
+        </div>` : "";
+
       view.innerHTML = `
         <div class="row" style="justify-content:space-between;align-items:flex-start">
           <a href="#/threads" class="meta">&larr; all conversations</a>
           <button id="c-delete" title="delete conversation">✕</button>
         </div>
         <h3 style="margin:8px 0 4px">${esc(t.title || "(untitled)")}</h3>
-        <div class="meta" style="margin-bottom:14px">${esc(fmtDate(t.updated_at))}</div>
-        ${turnsHtml || `<p class="meta">No turns yet.</p>`}
+        <div class="meta" style="margin-bottom:6px">${esc(fmtDate(t.updated_at))}</div>
+        ${parentBlock}
+        <div id="thread-turns">${turnsHtml || `<p class="meta">No turns yet.</p>`}</div>
+        <div id="thread-children"></div>
         <div class="card" style="margin-top:18px">
           <h3 style="margin:0 0 6px">Continue</h3>
           <textarea id="c-q" placeholder="follow-up question — fetches more sources if needed"></textarea>
@@ -385,11 +521,128 @@
         });
         if (r) {
           $("c-q").value = "";
-          // refresh thread detail so the new turn lands in the list above
           setTimeout(() => viewThreadDetail(tid), 600);
         }
       };
+
+      // Wire per-turn Branch buttons + selection-anchored "Ask about this".
+      _wireTurnBranching(tid, t);
+
+      // Load + render immediate children at the bottom (independent fetch so a
+      // failed children call doesn't block thread render).
+      _loadAndRenderChildren(tid);
+
+      // Breadcrumb focus: scroll the requested turn into view after render.
+      if (focusTurnId) {
+        const target = document.getElementById(`turn-${focusTurnId}`);
+        if (target) {
+          setTimeout(() => target.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+        }
+      }
     } catch (e) { toast(e.message, "err"); view.innerHTML = ""; }
+  }
+
+  function _wireTurnBranching(tid, thread) {
+    // Map turn id -> question, for the "Follow up on: ..." seed text.
+    const byId = {};
+    (thread.turns || []).forEach((t) => { if (t.id) byId[t.id] = t; });
+
+    // Turn-level Branch button: seeds composer with "Follow up on: <parent question>".
+    view.querySelectorAll('button.branch-btn[data-act="branch"]').forEach((btn) => {
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        const turnId = btn.dataset.turnId;
+        const t = byId[turnId];
+        const parentQ = (t && t.question) || "";
+        _stashBranchAndGo({
+          parent_thread_id: tid,
+          parent_turn_id: turnId,
+          seed: parentQ ? `Follow up on: ${parentQ}` : "",
+        });
+      };
+    });
+
+    // Selection-level branching: floating "Ask about this" button anchored to selection.
+    _installSelectionListener(tid);
+  }
+
+  let _floatingAskBtn = null;
+  function _clearFloatingAsk() {
+    if (_floatingAskBtn) { _floatingAskBtn.remove(); _floatingAskBtn = null; }
+  }
+
+  function _installSelectionListener(tid) {
+    // Use a single listener on the view container; check selection scope on each event.
+    // On iOS Safari this co-exists with the native context menu (the floating button
+    // sits above the answer area and disappears when the selection clears).
+    const handler = () => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed) { _clearFloatingAsk(); return; }
+      const range = sel.rangeCount ? sel.getRangeAt(0) : null;
+      if (!range) { _clearFloatingAsk(); return; }
+      // Selection must start *and* end inside a single turn's answer body.
+      const startAnchor = range.startContainer.parentElement
+        ? range.startContainer.parentElement.closest("[data-answer-body]") : null;
+      const endAnchor = range.endContainer.parentElement
+        ? range.endContainer.parentElement.closest("[data-answer-body]") : null;
+      if (!startAnchor || startAnchor !== endAnchor) { _clearFloatingAsk(); return; }
+      const turnCardEl = startAnchor.closest("[data-turn]");
+      if (!turnCardEl) { _clearFloatingAsk(); return; }
+      const turnId = turnCardEl.dataset.turn;
+      const quote = sel.toString().trim();
+      if (!quote) { _clearFloatingAsk(); return; }
+
+      const rect = range.getBoundingClientRect();
+      _clearFloatingAsk();
+      const btn = document.createElement("button");
+      btn.className = "selection-ask-btn";
+      btn.textContent = "Ask about this";
+      // Position above the selection in document coords (account for page scroll).
+      btn.style.top = `${Math.max(8, rect.top + window.scrollY - 38)}px`;
+      btn.style.left = `${Math.max(8, rect.left + window.scrollX)}px`;
+      btn.onmousedown = (e) => e.preventDefault();  // don't clear the selection on click-down
+      btn.onclick = (e) => {
+        e.preventDefault();
+        const truncatedSeed = quote.length > 200 ? quote.slice(0, 200).trimEnd() + "…" : quote;
+        _stashBranchAndGo({
+          parent_thread_id: tid,
+          parent_turn_id: turnId,
+          parent_quote: quote,
+          seed: `Going deeper on: ${truncatedSeed}`,
+        });
+      };
+      document.body.appendChild(btn);
+      _floatingAskBtn = btn;
+    };
+    document.addEventListener("selectionchange", handler);
+    // Clear on hashchange + tear listener down so we don't leak across routes.
+    const teardown = () => {
+      document.removeEventListener("selectionchange", handler);
+      _clearFloatingAsk();
+      window.removeEventListener("hashchange", teardown);
+    };
+    window.addEventListener("hashchange", teardown);
+  }
+
+  async function _loadAndRenderChildren(tid) {
+    const slot = $("thread-children");
+    if (!slot) return;
+    try {
+      const kids = await api(`/threads/${encodeURIComponent(tid)}/children`);
+      if (!kids || !kids.length) { slot.innerHTML = ""; return; }
+      slot.innerHTML = `
+        <div class="card" style="margin-top:14px">
+          <h3 style="margin:0 0 6px">Branched threads (${kids.length})</h3>
+          <div class="meta" style="margin-bottom:6px">Forks that branched off from this conversation.</div>
+          ${kids.map((c) => `
+            <a class="card" style="display:block;margin-top:6px" href="#/threads/${encodeURIComponent(c.id)}">
+              <div>${esc(c.title || c.first_turn_question || "(untitled)")} ${c.has_quote ? '<span class="has-quote-tag">selection</span>' : ""}</div>
+              <div class="meta">${esc(fmtDate(c.created_at))}</div>
+            </a>`).join("")}
+        </div>`;
+    } catch (e) {
+      // Non-fatal — just leave the slot empty.
+    }
   }
 
   // -------------------- Learn (course layer) -------------------- //
@@ -784,7 +1037,12 @@
     [/^#\/reports\/(.+)$/, (m) => viewReportDetail(decodeURIComponent(m[1]))],
     [/^#\/search$/, viewSearch],
     [/^#\/threads$/, viewThreads],
-    [/^#\/threads\/(.+)$/, (m) => viewThreadDetail(decodeURIComponent(m[1]))],
+    [/^#\/threads\/([^?]+)(?:\?(.*))?$/, (m) => {
+      const tid = decodeURIComponent(m[1]);
+      const qs = new URLSearchParams(m[2] || "");
+      const focus = qs.get("focus");
+      return viewThreadDetail(tid, focus ? decodeURIComponent(focus) : null);
+    }],
     [/^#\/learn$/, viewCourses],
     [/^#\/learn\/(.+)$/, (m) => viewCourseDetail(decodeURIComponent(m[1]))],
   ];

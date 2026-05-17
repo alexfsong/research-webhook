@@ -123,3 +123,46 @@ a.card:hover { border-color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 details { margin-top: 12px; }
 details summary { cursor: pointer; padding: 6px 0; }
+
+/* Thread-branching: turn-level Branch button + selection-anchored "Ask about this" */
+.branch-btn {
+  background: transparent; color: var(--accent);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 10px; font-size: 12px;
+}
+.branch-btn:hover { border-color: var(--accent); }
+.selection-ask-btn {
+  position: absolute; z-index: 50;
+  background: var(--accent); color: #fff; border: 0;
+  padding: 6px 12px; border-radius: 6px;
+  font-size: 13px; font-weight: 600;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  cursor: pointer;
+}
+.parent-breadcrumb {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px;
+  font-size: 12px; color: var(--muted); background: var(--panel);
+}
+.parent-breadcrumb a { color: var(--accent); }
+.parent-quote {
+  border-left: 3px solid var(--accent);
+  margin: 8px 0 14px; padding: 6px 0 6px 12px;
+  color: var(--muted); font-style: italic;
+}
+.tree-row { display: flex; align-items: stretch; gap: 6px; }
+.tree-toggle {
+  flex: 0 0 24px;
+  display: inline-flex; align-items: flex-start; justify-content: center;
+  padding-top: 16px;
+  background: transparent; color: var(--muted); border: 0;
+  font-family: ui-monospace, SFMono-Regular, monospace; font-size: 13px;
+  cursor: pointer;
+}
+.tree-toggle.placeholder { cursor: default; opacity: 0; }
+.tree-children { /* indentation handled inline via style="padding-left:<n>px" */ }
+.has-quote-tag {
+  display: inline-block; margin-left: 6px;
+  padding: 1px 6px; border: 1px solid var(--border); border-radius: 8px;
+  font-size: 11px; color: var(--muted);
+}

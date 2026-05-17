@@ -38,6 +38,7 @@ ASK_DEFAULT_MAX_FETCHES = int(os.environ.get("ASK_DEFAULT_MAX_FETCHES", "10"))
 ASK_HISTORY_MAX_TURNS = int(os.environ.get("ASK_HISTORY_MAX_TURNS", "4"))
 ASK_HISTORY_ANSWER_TRUNC = int(os.environ.get("ASK_HISTORY_ANSWER_TRUNC", "800"))
 ASK_DEPTH_ENABLED = os.environ.get("ASK_DEPTH_ENABLED", "true").lower() == "true"
+THREAD_BRANCHING_ENABLED = os.environ.get("THREAD_BRANCHING_ENABLED", "true").lower() == "true"
 
 CLAUDE_FALLBACK_USER = os.environ.get("CLAUDE_FALLBACK_USER", "claude-runner").strip()
 CLAUDE_FALLBACK_TIMEOUT = int(os.environ.get("CLAUDE_FALLBACK_TIMEOUT", "240"))
@@ -76,6 +77,10 @@ class AskRequest(BaseModel):
     max_fetches: int | None = None
     urls: list[str] | None = None
     topic: str | None = None
+    # Branching: single-parent in v1, schema is DAG-ready.
+    parent_thread_id: str | None = None
+    parent_turn_id: str | None = None
+    parent_quote: str | None = None
 
 
 class ReportSection(BaseModel):
@@ -330,6 +335,70 @@ async def _ask_fail(run_id: str, message: str) -> None:
     log.warning("ask run %s failed: %s", run_id, message)
 
 
+_CITE_PATTERN = re.compile(r"\[(\d+)\]")
+
+
+def _resolve_carried_sources(parent_quote: str, parent_citations: list[dict],
+                             *, cap: int = 5) -> list[dict]:
+    """Find `[n]` markers inside `parent_quote` and resolve them against
+    parent_citations. Returns [] when quote is empty or no markers overlap.
+
+    Caps at the first `cap` distinct sources so prompt context stays bounded.
+    """
+    if not parent_quote or not parent_citations:
+        return []
+    indices: list[int] = []
+    seen: set[int] = set()
+    for m in _CITE_PATTERN.finditer(parent_quote):
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        if n in seen:
+            continue
+        seen.add(n)
+        indices.append(n)
+        if len(indices) >= cap:
+            break
+    by_n = {int(c.get("n", 0)): c for c in parent_citations if c.get("n")}
+    out: list[dict] = []
+    for n in indices:
+        c = by_n.get(n)
+        if not c:
+            continue
+        out.append({"n": n, "title": c.get("title") or "", "url": c.get("url") or ""})
+    return out
+
+
+def _build_parent_context(parent_thread_id: str, parent_turn_id: str,
+                          parent_quote: str | None) -> dict | None:
+    """Pull parent turn + carried sources for the routine payload.
+
+    Returns None when the parent turn can't be loaded (caller already
+    validated existence, this is defensive against race conditions).
+    """
+    turn = courses_db.get_ask_turn(parent_turn_id)
+    if not turn or turn.get("thread_id") != parent_thread_id:
+        return None
+    parent_question = turn.get("question") or ""
+    parent_answer = turn.get("answer_md") or ""
+    parent_citations = turn.get("citations") or []
+
+    answer_excerpt = parent_answer
+    if len(answer_excerpt) > ASK_HISTORY_ANSWER_TRUNC:
+        answer_excerpt = answer_excerpt[:ASK_HISTORY_ANSWER_TRUNC].rstrip() + "…"
+
+    carried = _resolve_carried_sources(parent_quote or "", parent_citations)
+    out: dict = {
+        "question": parent_question,
+        "answer_excerpt": answer_excerpt,
+        "carried_sources": carried,
+    }
+    if parent_quote:
+        out["quote"] = parent_quote
+    return out
+
+
 async def _ask_kickoff(req: AskRequest, bearer: str = "anon") -> dict:
     """Shared entry point for POST /ask and POST /threads/{id}/ask."""
     if not _llamaindex_enabled:
@@ -343,10 +412,38 @@ async def _ask_kickoff(req: AskRequest, bearer: str = "anon") -> dict:
     if depth not in ASK_DEPTH_BUDGETS:
         raise HTTPException(422, f"unknown depth: {depth}")
 
-    is_continuation = bool(req.thread_id)
-    thread_id = req.thread_id or courses_db.create_ask_thread(
-        title=_summarize_title(q or "URL ingest"),
-    )
+    # --- Branching: validate parent fields when present ----------------
+    has_parent = bool(req.parent_thread_id or req.parent_turn_id or req.parent_quote)
+    if has_parent:
+        if not THREAD_BRANCHING_ENABLED:
+            raise HTTPException(400, "thread branching disabled")
+        if not (req.parent_thread_id and req.parent_turn_id):
+            raise HTTPException(400, "parent_thread_id and parent_turn_id are both required when branching")
+        if not courses_db.get_ask_thread(req.parent_thread_id):
+            raise HTTPException(400, "parent_thread_id not found")
+        parent_turn = courses_db.get_ask_turn(req.parent_turn_id)
+        if not parent_turn or parent_turn.get("thread_id") != req.parent_thread_id:
+            raise HTTPException(400, "parent_turn_id does not belong to parent_thread_id")
+
+    if has_parent:
+        # Branches always force a brand-new thread (bypass thread_id reuse path).
+        try:
+            thread_id = courses_db.create_ask_thread(
+                title=_summarize_title(q or "URL ingest"),
+                parent_thread_id=req.parent_thread_id,
+                parent_turn_id=req.parent_turn_id,
+                parent_quote=req.parent_quote,
+            )
+        except courses_db.SingleParentViolation:
+            # Physically unreachable for fresh tids today; here so a future
+            # change to re-parenting helpers surfaces as HTTP 400, not 500.
+            raise HTTPException(400, "thread already has a parent")
+        is_continuation = False
+    else:
+        is_continuation = bool(req.thread_id)
+        thread_id = req.thread_id or courses_db.create_ask_thread(
+            title=_summarize_title(q or "URL ingest"),
+        )
     history: list[dict] = []
     if is_continuation:
         thread = courses_db.get_ask_thread(thread_id)
@@ -375,6 +472,10 @@ async def _ask_kickoff(req: AskRequest, bearer: str = "anon") -> dict:
         "urls": urls,
         "history": history,
     }
+    if has_parent:
+        pc = _build_parent_context(req.parent_thread_id, req.parent_turn_id, req.parent_quote)
+        if pc is not None:
+            payload["parent_context"] = pc
 
     if depth == "deep":
         today_n = await asyncio.to_thread(courses_db.count_deep_today, bearer)
@@ -407,6 +508,8 @@ async def _ask_kickoff(req: AskRequest, bearer: str = "anon") -> dict:
             "ts": _now_iso(), "run_id": run_id, "route": route, "depth": depth,
             "thread_id": thread_id, "turn_id": turn_id,
             "q_prefix": q[:80],
+            "parent_thread_id": req.parent_thread_id or "",
+            "parent_turn_id": req.parent_turn_id or "",
         })
 
     if depth == "deep":
@@ -465,7 +568,30 @@ async def thread_detail(thread_id: str):
     t = courses_db.get_ask_thread(thread_id)
     if not t:
         raise HTTPException(404, "thread not found")
+    # Always include `parents` (length ≤ 1 in v1) so the PWA breadcrumb code path
+    # doesn't have to branch on whether the field is present.
+    t["parents"] = courses_db.get_ask_thread_parents(thread_id)
     return t
+
+
+@router.get("/threads/{thread_id}/children", dependencies=[Depends(_require_auth)])
+async def thread_children(thread_id: str):
+    """Immediate child threads (one level). Sorted by created_at DESC."""
+    if not courses_db.get_ask_thread(thread_id):
+        raise HTTPException(404, "thread not found")
+    return courses_db.get_ask_thread_children(thread_id)
+
+
+@router.get("/threads/{thread_id}/descendants", dependencies=[Depends(_require_auth)])
+async def thread_descendants(thread_id: str):
+    """Transitive descendants for the tree-collapse Threads index renderer.
+
+    Each entry includes a `depth` field (1 = immediate child) so the PWA can
+    indent by nesting level.
+    """
+    if not courses_db.get_ask_thread(thread_id):
+        raise HTTPException(404, "thread not found")
+    return courses_db.get_ask_thread_descendants(thread_id)
 
 
 @router.delete("/threads/{thread_id}", dependencies=[Depends(_require_auth)])

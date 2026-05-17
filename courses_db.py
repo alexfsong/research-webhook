@@ -142,6 +142,16 @@ SCHEMA = [
       UNIQUE(thread_id, idx)
     )
     """,
+    # --- ask_thread_parents (thread-branching join table; DAG-ready, v1 single-parent) ---
+    """
+    CREATE TABLE IF NOT EXISTS ask_thread_parents (
+      thread_id TEXT NOT NULL REFERENCES ask_threads(id) ON DELETE CASCADE,
+      parent_thread_id TEXT NOT NULL REFERENCES ask_threads(id) ON DELETE CASCADE,
+      parent_turn_id TEXT NOT NULL REFERENCES ask_turns(id) ON DELETE CASCADE,
+      parent_quote TEXT,
+      created_at TEXT NOT NULL
+    )
+    """,
     # --- ask_deep_queue (deep-research subscription-quota queue) ---
     """
     CREATE TABLE IF NOT EXISTS ask_deep_queue (
@@ -172,6 +182,11 @@ SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_ask_turns_run ON ask_turns(run_id)",
     "CREATE INDEX IF NOT EXISTS idx_deep_queue_bearer ON ask_deep_queue(bearer, status, enqueued_at)",
     "CREATE INDEX IF NOT EXISTS idx_deep_queue_status ON ask_deep_queue(status, enqueued_at)",
+    # Thread branching: forward (child -> parent), reverse (parent -> children),
+    # and v1 single-parent invariant. Drop the UNIQUE index to enable DAG later.
+    "CREATE INDEX IF NOT EXISTS idx_ask_thread_parents_thread ON ask_thread_parents(thread_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ask_thread_parents_parent ON ask_thread_parents(parent_thread_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ask_thread_parents_single_v1 ON ask_thread_parents(thread_id)",
 ]
 
 
@@ -480,7 +495,29 @@ def get_status(course_id: str) -> dict | None:
 # ask_threads / ask_turns DAO — backs POST /ask + Conversations tab.
 # ------------------------------------------------------------------------- #
 
-def create_ask_thread(title: str) -> str:
+class SingleParentViolation(Exception):
+    """Raised when a second ask_thread_parents row would be inserted for the same thread_id.
+
+    v1 enforces single-parent via the UNIQUE INDEX on ask_thread_parents(thread_id);
+    SQLite surfaces the violation as IntegrityError, which the DAO translates to this
+    application-level exception for the webhook to convert into HTTP 400.
+    """
+
+
+def create_ask_thread(
+    title: str,
+    *,
+    parent_thread_id: str | None = None,
+    parent_turn_id: str | None = None,
+    parent_quote: str | None = None,
+) -> str:
+    """Create a new ask_thread. When parent_* are provided, also insert one row
+    into ask_thread_parents linking the new thread to the parent turn.
+
+    Caller is responsible for validating that parent_thread_id and parent_turn_id
+    exist + belong together; this DAO just enforces the single-parent invariant
+    at the SQLite layer.
+    """
     tid = _new_id("thr")
     now = _now()
     with get_conn() as conn:
@@ -488,7 +525,99 @@ def create_ask_thread(title: str) -> str:
             "INSERT INTO ask_threads(id,title,created_at,updated_at) VALUES (?,?,?,?)",
             (tid, title, now, now),
         )
+        if parent_thread_id and parent_turn_id:
+            try:
+                conn.execute(
+                    "INSERT INTO ask_thread_parents(thread_id,parent_thread_id,parent_turn_id,parent_quote,created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (tid, parent_thread_id, parent_turn_id, parent_quote, now),
+                )
+            except sqlite3.IntegrityError as e:
+                # New thread can never collide on UNIQUE(thread_id) since `tid` is
+                # freshly minted, so this branch is only reachable if a future caller
+                # adapts this helper for re-parenting. Translate for the webhook.
+                conn.execute("DELETE FROM ask_threads WHERE id=?", (tid,))
+                raise SingleParentViolation(str(e)) from e
     return tid
+
+
+def get_ask_thread_parents(thread_id: str) -> list[dict]:
+    """Return parent link records for `thread_id`. Always ≤ 1 entry in v1.
+
+    Each entry: `{thread_id, turn_id, quote?, created_at}`. Drop the v1 UNIQUE
+    index to allow multiple entries (DAG); the consumer shape doesn't change.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT parent_thread_id, parent_turn_id, parent_quote, created_at "
+            "FROM ask_thread_parents WHERE thread_id=? ORDER BY created_at",
+            (thread_id,),
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        entry = {
+            "thread_id": r["parent_thread_id"],
+            "turn_id": r["parent_turn_id"],
+            "created_at": r["created_at"],
+        }
+        if r["parent_quote"]:
+            entry["quote"] = r["parent_quote"]
+        out.append(entry)
+    return out
+
+
+def get_ask_thread_children(thread_id: str) -> list[dict]:
+    """Return immediate child thread summaries sorted by created_at DESC.
+
+    Each: `{id, title, first_turn_question, created_at, has_quote}`.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT t.id, t.title, t.created_at, t.updated_at, p.parent_quote, "
+            "       (SELECT question FROM ask_turns WHERE thread_id=t.id ORDER BY idx LIMIT 1) AS first_question "
+            "FROM ask_thread_parents p "
+            "JOIN ask_threads t ON t.id = p.thread_id "
+            "WHERE p.parent_thread_id=? "
+            "ORDER BY t.created_at DESC",
+            (thread_id,),
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "first_turn_question": r["first_question"] or "",
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "has_quote": bool(r["parent_quote"]),
+        }
+        for r in rows
+    ]
+
+
+def get_ask_thread_descendants(thread_id: str) -> list[dict]:
+    """Transitive children of `thread_id`. Each entry adds `depth` (1 = immediate child).
+
+    Used by the Threads-index tree renderer in the PWA. Walks the join table
+    iteratively in Python rather than via a recursive CTE so the implementation
+    stays readable + cycle-safe (cycles are physically impossible in v1 anyway).
+    """
+    visited: set[str] = {thread_id}
+    out: list[dict] = []
+    queue: list[tuple[str, int]] = [(thread_id, 0)]
+    while queue:
+        cur, depth = queue.pop(0)
+        children = get_ask_thread_children(cur)
+        for c in children:
+            cid = c["id"]
+            if cid in visited:
+                continue
+            visited.add(cid)
+            entry = dict(c)
+            entry["depth"] = depth + 1
+            entry["parent_thread_id"] = cur
+            out.append(entry)
+            queue.append((cid, depth + 1))
+    return out
 
 
 def add_ask_turn(
@@ -589,14 +718,30 @@ def get_ask_thread(thread_id: str) -> dict | None:
 
 
 def list_ask_threads(limit: int = 50) -> list[dict]:
+    """Threads index summary. Each row includes parent linkage so the PWA can
+    render the tree without an N+1 lookup.
+
+    Fields: id, title, created_at, updated_at, turn_count, parent_thread_id
+    (null when this thread is a root), has_quote (bool, true when a selection-
+    level branch).
+    """
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT t.id, t.title, t.created_at, t.updated_at, "
-            "       (SELECT COUNT(*) FROM ask_turns WHERE thread_id=t.id) AS turn_count "
-            "FROM ask_threads t ORDER BY t.updated_at DESC LIMIT ?",
+            "       (SELECT COUNT(*) FROM ask_turns WHERE thread_id=t.id) AS turn_count, "
+            "       p.parent_thread_id AS parent_thread_id, "
+            "       CASE WHEN p.parent_quote IS NOT NULL AND p.parent_quote <> '' THEN 1 ELSE 0 END AS has_quote "
+            "FROM ask_threads t "
+            "LEFT JOIN ask_thread_parents p ON p.thread_id = t.id "
+            "ORDER BY t.updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        d["has_quote"] = bool(d.get("has_quote"))
+        out.append(d)
+    return out
 
 
 def delete_ask_thread(thread_id: str) -> bool:
