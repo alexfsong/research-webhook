@@ -83,7 +83,7 @@
   }
 
   function renderReport(report) {
-    const toc = (report.toc || []).map((h, i) => `<li><a href="#sec-${i}">${esc(h)}</a></li>`).join("");
+    const toc = (report.toc || []).map((h, i) => `<li><a href="#sec-${i}" data-toc-target="sec-${i}">${esc(h)}</a></li>`).join("");
     const sections = (report.sections || []).map((s, i) => {
       const cites = (s.citations || []).map(_citationCard).join("");
       return `
@@ -1059,6 +1059,13 @@
     location.hash = "#/ask";
   }
   window.addEventListener("hashchange", () => { stopPoll(); route(); });
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest("[data-toc-target]");
+    if (!a) return;
+    e.preventDefault();
+    const el = document.getElementById(a.getAttribute("data-toc-target"));
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
 
   if (token) showApp(); else showGate();
 })();
