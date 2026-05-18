@@ -27,9 +27,6 @@ import pytest
 def mem_courses_db(tmp_path, monkeypatch):
     """Yield a freshly migrated courses_db module pointed at a tmp SQLite file."""
     db_file = tmp_path / "courses.db"
-    # Ensure no stale import from a prior test holds the old DB_PATH.
-    if "courses_db" in sys.modules:
-        del sys.modules["courses_db"]
     import courses_db  # noqa: WPS433
 
     monkeypatch.setattr(courses_db, "DB_PATH", db_file)
